@@ -1,0 +1,48 @@
+// Gateway config patch, not a standalone config. Apply after building/installing OpenClaw:
+//   pnpm openclaw config patch --file deploy/openclaw-feature-overrides.patch.json5 --dry-run
+//   pnpm openclaw config patch --file deploy/openclaw-feature-overrides.patch.json5
+//
+// `anthropic/claude-haiku-4-5` is a chat-model reference, not a registered Decision Model.
+// Use the bundled local ONNX decision model instead; download its artifacts separately.
+{
+  tools: {
+    codeMode: {
+      enabled: true,
+    },
+    toolSearch: { enabled: true },
+    exec: {
+      mode: "full",
+      applyPatch: { workspaceOnly: false },
+    },
+    fs: { workspaceOnly: false },
+  },
+  agents: {
+    defaults: {
+      experimental: { decisionAssistance: true },
+      decisionModel: "onnx/gliclass-edge-v3.0",
+    },
+  },
+  gateway: {
+    controlUi: { experimental: { customPlugins: true } },
+  },
+  desktop: {
+    host: { enabled: true },
+  },
+  cloudWorkers: { desktop: true },
+  plugins: {
+    entries: {
+      // Required by the configured local decisionModel; downloads are not bundled.
+      onnx: { enabled: true },
+      workboard: { enabled: true },
+      // Explicit enablement ensures the requested Codex app-server setting is loaded.
+      codex: {
+        enabled: true,
+        config: {
+          appServer: {
+            experimental: { sandboxExecServer: true },
+          },
+        },
+      },
+    },
+  },
+}
