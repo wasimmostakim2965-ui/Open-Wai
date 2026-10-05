@@ -44,6 +44,9 @@ export function createWorkerPlacementTools(params: {
     codingRoot: params.cwd,
     containmentRoot: params.containmentRoot,
     includeBaseCodingTools: true,
+    // A worker turn contains apply_patch to its own containment root regardless of
+    // configuration; only an explicit full permission mode lifts it.
+    applyPatchWorkspaceOnly: params.permissionMode !== "full",
     shellTools: execUnavailable ? "patch-only" : "full",
     execDefaults: {
       ...policy,

@@ -16,9 +16,10 @@ const HINTS: Record<ApplyPatchContainmentSource, string> = {
     "mode and workspaceOnly configuration settings do not lift this boundary. Keep patch paths " +
     "within the required root.",
   config:
-    "apply_patch is workspace-contained by configuration. Both tools.exec.applyPatch.workspaceOnly " +
-    "(default true) and tools.fs.workspaceOnly impose this independently, so clearing one can leave " +
-    "the other in force. tools.exec.mode does not affect it.",
+    "apply_patch is workspace-contained by configuration. An explicit " +
+    "tools.exec.applyPatch.workspaceOnly=true or tools.fs.workspaceOnly=true imposed this " +
+    "(both default to false, matching read/write/edit). Clearing the setting you set lifts the " +
+    "boundary; tools.exec.mode does not affect it.",
   session:
     "apply_patch is workspace-contained by this session's permission mode. Only a full permission " +
     "mode lifts it; configuration settings do not override a session mode.",

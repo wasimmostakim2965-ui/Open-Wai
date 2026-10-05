@@ -67,7 +67,7 @@ describe("prepared core tool policy", () => {
       workspaceOnly: false,
       readOnly: false,
       applyPatchEnabled: true,
-      applyPatchWorkspaceOnly: true,
+      applyPatchWorkspaceOnly: false,
       applyPatchContainmentSource: "config",
       imageSanitization: { maxDimensionPx: 800 },
       modelContextWindowTokens: 32000,

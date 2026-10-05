@@ -49,8 +49,11 @@ export function prepareCoreToolPolicy(
       !readOnly &&
       patch?.enabled !== false &&
       isApplyPatchAllowedForModel(options, patch?.allowModels),
+    // Defaults to the same open policy as read/write/edit so an owner agent can
+    // edit its own checkout; set tools.exec.applyPatch.workspaceOnly=true (or
+    // tools.fs.workspaceOnly) to contain patches again.
     applyPatchWorkspaceOnly:
-      workspaceOnly || (sessionPolicy?.applyPatchWorkspaceOnly ?? patch?.workspaceOnly !== false),
+      workspaceOnly || (sessionPolicy?.applyPatchWorkspaceOnly ?? patch?.workspaceOnly === true),
     applyPatchContainmentSource,
     imageSanitization: resolveImageSanitizationLimits(options.config),
     modelContextWindowTokens: options.modelContextWindowTokens,

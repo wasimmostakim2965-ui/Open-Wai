@@ -74,7 +74,7 @@ describe("Agent-specific tool filtering", () => {
         tools: {
           allow: ["read", "write", "exec"],
           exec: {
-            applyPatch: opts.workspaceOnly === false ? { workspaceOnly: false } : {},
+            applyPatch: opts.workspaceOnly === undefined ? {} : { workspaceOnly: opts.workspaceOnly },
           },
         },
       };
@@ -228,26 +228,26 @@ describe("Agent-specific tool filtering", () => {
     expect(toolNames).not.toContain("apply_patch");
   });
 
-  it("defaults apply_patch to workspace-only (blocks traversal)", async () => {
+  it("defaults apply_patch to host-open, matching read/write/edit", async () => {
     await withApplyPatchEscapeCase({}, async ({ applyPatchTool, escapedPath, patch }) => {
-      await expect(applyPatchTool.execute("tc1", { input: patch })).rejects.toThrow(
-        /Path escapes sandbox root/,
-      );
-      const readError = await fs.readFile(escapedPath, "utf8").then(
-        () => undefined,
-        (err: unknown) => err,
-      );
-      expect(readError).toMatchObject({ code: "ENOENT" });
+      await applyPatchTool.execute("tc1", { input: patch });
+      const contents = await fs.readFile(escapedPath, "utf8");
+      expect(contents).toBe("escaped\n");
     });
   });
 
-  it("allows disabling apply_patch workspace-only via config (dangerous)", async () => {
+  it("contains apply_patch when workspaceOnly is set in config", async () => {
     await withApplyPatchEscapeCase(
-      { workspaceOnly: false },
+      { workspaceOnly: true },
       async ({ applyPatchTool, escapedPath, patch }) => {
-        await applyPatchTool.execute("tc2", { input: patch });
-        const contents = await fs.readFile(escapedPath, "utf8");
-        expect(contents).toBe("escaped\n");
+        await expect(applyPatchTool.execute("tc2", { input: patch })).rejects.toThrow(
+          /Path escapes sandbox root/,
+        );
+        const readError = await fs.readFile(escapedPath, "utf8").then(
+          () => undefined,
+          (err: unknown) => err,
+        );
+        expect(readError).toMatchObject({ code: "ENOENT" });
       },
     );
   });

@@ -46,9 +46,9 @@ runs to the end of the file.
 
 - Patch paths support relative paths (from the workspace directory) and absolute paths.
 - Use `./~/file` for a file inside a literal `~` directory; `~/file` retains its home-directory meaning.
-- `tools.exec.applyPatch.workspaceOnly` defaults to `true` (workspace-contained). Set it to `false` only if you intentionally want `apply_patch` to write/delete outside the workspace directory.
-- This setting is independent of `tools.exec.mode`. Setting `tools.exec.mode: "full"` does not lift the `apply_patch` workspace boundary.
-- `tools.fs.workspaceOnly` contains `apply_patch` independently, so clearing one setting can leave the other in force.
+- `tools.exec.applyPatch.workspaceOnly` defaults to `false`, matching `read`/`write`/`edit`: `apply_patch` may write/delete outside the workspace directory unless you set it to `true`. Set it to `true` to contain patches to the workspace.
+- This setting is independent of `tools.exec.mode`. Setting `tools.exec.mode: "full"` does not affect the `apply_patch` workspace boundary.
+- `tools.fs.workspaceOnly: true` contains `read`/`write`/`edit`/`apply_patch` together, so it contains `apply_patch` independently of `tools.exec.applyPatch.workspaceOnly`.
 - An explicit session permission mode overrides both configuration settings: `full` removes their containment, `guarded` and `workspace` contain `apply_patch`, and `read-only` omits the tool.
 - Required workspace roots and sandbox restrictions still apply in `full` mode. Keep patch paths inside a required root; changing either configuration setting or the session mode cannot lift it.
 - When a host workspace boundary rejects a patch, the operator log names the configuration, session policy, worker default, or required root responsible. This advice is available in both the OpenClaw and Codex harnesses; the model-visible rejection stays unchanged. Sandbox bridge rejections retain their own explanation.
