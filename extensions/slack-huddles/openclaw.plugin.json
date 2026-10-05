@@ -10,7 +10,7 @@
       "hasSubcommands": true
     }
   ],
-  "enabledByDefault": false,
+  "enabledByDefault": true,
   "commandAliases": [{ "name": "slackhuddles" }],
   "activation": {
     "onStartup": true,

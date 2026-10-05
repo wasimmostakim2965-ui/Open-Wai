@@ -5,7 +5,7 @@
   "categories": [
     "developer-tools"
   ],
-  "enabledByDefault": false,
+  "enabledByDefault": true,
   "cliCommands": [
     {
       "name": "onnx",

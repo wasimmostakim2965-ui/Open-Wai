@@ -4,7 +4,7 @@
   "categories": ["productivity"],
   "name": "Logbook",
   "description": "Automatic work journal: captures periodic screen snapshots from a paired node and turns them into a reviewable timeline of your day.",
-  "enabledByDefault": false,
+  "enabledByDefault": true,
   "activation": {
     "onStartup": true
   },

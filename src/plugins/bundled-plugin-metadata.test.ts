@@ -458,7 +458,7 @@ describe("bundled plugin metadata", () => {
     expect(entry?.manifest.activation?.onCommands).toStrictEqual(["codex"]);
   });
 
-  it("keeps empty-config Gateway startup narrower than declared startup sidecars", () => {
+  it("starts every bundled plugin that declares default enablement plus startup", () => {
     const manifestRegistry = createRepoBundledManifestRegistry();
     const linuxOnlyPlugin = manifestRegistry.plugins[0];
     assert(linuxOnlyPlugin, "expected bundled plugin manifest fixture");
@@ -480,7 +480,7 @@ describe("bundled plugin metadata", () => {
       ...EXPECTED_EMPTY_CONFIG_GATEWAY_STARTUP_EXTRAS,
     ].toSorted((left, right) => left.localeCompare(right));
 
-    expect(expectedPluginIds).not.toContain("slack-huddles");
+    expect(expectedPluginIds).toContain("slack-huddles");
     expect(
       resolveGatewayStartupPluginPlanFromRegistry({
         config: {},

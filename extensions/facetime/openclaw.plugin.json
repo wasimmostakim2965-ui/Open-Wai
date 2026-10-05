@@ -3,7 +3,7 @@
   "name": "FaceTime",
   "description": "Experimental FaceTime realtime voice carrier for OpenClaw agents",
   "categories": ["voice"],
-  "enabledByDefault": false,
+  "enabledByDefault": true,
   "activation": {
     "onStartup": true
   },

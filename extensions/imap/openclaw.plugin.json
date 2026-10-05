@@ -4,7 +4,7 @@
   "name": "IMAP email trigger",
   "description": "Watch IMAP mailboxes and dispatch authenticated incoming email to isolated agent sessions.",
   "activation": { "onStartup": true },
-  "enabledByDefault": false,
+  "enabledByDefault": true,
   "configContracts": {
     "secretInputs": {
       "bundledDefaultEnabled": false,
