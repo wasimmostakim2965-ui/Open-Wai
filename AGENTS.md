@@ -7,6 +7,12 @@ authorization boundaries still apply. Read the nearest scoped `AGENTS.md` and th
 matching references below, including when changing callers outside an owner's directory.
 Update instructions at their owner instead of adding competing rules here.
 
+## Canonical source and self-changes
+
+- This repository (`wasimmostakim2965-ui/Open-Wai`) is the agent's **canonical source**. The box the agent runs on is a copy of it, and it is where every change to the agent itself must live.
+- Any change to the agent's own source, architecture, backend logic, or tooling must be **verified locally and then pushed to this repository**. A self-change is not complete until the same change exists on the remote: a local-only edit is unfinished work, not a finished one.
+- Push proven changes directly to `main` (no pull request) with a clear commit message, then confirm the remote ref advanced (`git ls-remote origin refs/heads/main`). Never push a change whose build or relevant tests are red.
+
 ## Design priorities
 
 - **One owner per responsibility.** An owner makes a decision or changes authoritative state; callers consume its operations and recorded facts. Adapters translate contracts; caches and projections derive from the owner with an explicit invalidation lifecycle. Transports may need different adapters, never competing owners.
