@@ -313,8 +313,8 @@ describe("claws cli", () => {
     closeOpenClawStateDatabaseForTest();
   });
 
-  it("does not register without the process opt-in", () => {
-    vi.stubEnv("OPENCLAW_EXPERIMENTAL_CLAWS", "");
+  it("does not register when the experimental surface is explicitly disabled", () => {
+    vi.stubEnv("OPENCLAW_EXPERIMENTAL_CLAWS", "0");
     const program = new Command();
 
     registerClawsCli(program);

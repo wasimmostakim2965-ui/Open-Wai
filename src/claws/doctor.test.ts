@@ -280,11 +280,11 @@ describe("collectClawStateHealthFindings", () => {
     expect(afterMetadata.journal).toEqual(beforeMetadata.journal);
   });
 
-  it("stays hidden when the experimental Claws surface is disabled", async () => {
+  it("stays hidden when the experimental Claws surface is explicitly disabled", async () => {
     const current = await fixture();
     await expect(
       collectClawStateHealthFindings({
-        env: { ...current.env, OPENCLAW_EXPERIMENTAL_CLAWS: "" },
+        env: { ...current.env, OPENCLAW_EXPERIMENTAL_CLAWS: "0" },
         cfg: {},
       }),
     ).resolves.toEqual([]);
