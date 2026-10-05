@@ -21,6 +21,7 @@ const CORE_TOOL_FACTORY_DESCRIPTORS = [
   { name: "process", family: "shell" },
   { name: "agents_list", family: "openclaw" },
   { name: "self_status", family: "openclaw" },
+  { name: "runtime_diagnostics", family: "openclaw" },
   // Static factory identity only; runtime and tools.catalog apply the Swarm config gate.
   { name: "agents_wait", family: "openclaw" },
   { name: "ask_user", family: "openclaw" },

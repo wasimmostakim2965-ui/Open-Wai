@@ -58,6 +58,7 @@ const MESSAGE_READ_ONLY_ACTIONS = new Set([
 const REPLAY_SAFE_TOOL_NAMES = new Set([
   "agents_list",
   "self_status",
+  "runtime_diagnostics",
   "conversations_list",
   "find",
   "get_goal",

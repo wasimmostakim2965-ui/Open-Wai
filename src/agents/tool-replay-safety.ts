@@ -19,6 +19,7 @@ const UNCONDITIONALLY_REPLAY_SAFE_TOOL_NAMES = new Set([
   "sessions_search",
   "agents_list",
   "self_status",
+  "runtime_diagnostics",
   "conversations_list",
   "get_goal",
   "tool_search",

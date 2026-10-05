@@ -19,6 +19,8 @@ export const AGENTS_WAIT_TOOL_DISPLAY_SUMMARY = "Wait for collector subagents.";
 export const SESSION_STATUS_TOOL_DISPLAY_SUMMARY = "Show session status/model/usage.";
 export const SELF_STATUS_TOOL_DISPLAY_SUMMARY =
   "Report this install's version, build, source checkout, and update availability.";
+export const RUNTIME_DIAGNOSTICS_TOOL_DISPLAY_SUMMARY =
+  "Report the agent's own runtime health: degraded plugins, secrets, and WAL state.";
 export const ASK_USER_TOOL_DISPLAY_SUMMARY = "Ask the user and wait for an answer.";
 export const SUGGEST_TASK_TOOL_DISPLAY_SUMMARY = "Suggest follow-up work for operator approval.";
 export const DISMISS_TASK_TOOL_DISPLAY_SUMMARY = "Withdraw a pending task suggestion.";
@@ -206,5 +208,16 @@ export function describeSelfStatusTool(): string {
     "Use it before self-modifying work to learn whether the agent runs from a source checkout it can edit, and which update channel it follows.",
     "Set `refresh` true to fetch remote git/npm state and report whether an update is available (`updateAvailable`, `git.behind`, `registry.latestVersion`, `hint`); refresh is slower because it uses the network.",
     "Default (no refresh) reports local identity only and never contacts the network.",
+  ].join(" ");
+}
+
+/** Describes the runtime_diagnostics tool: the agent's own runtime health. */
+export function describeRuntimeDiagnosticsTool(): string {
+  return [
+    "Report this agent's own runtime health from process-local state: `healthy`, `issueCount`, and three sections.",
+    "`plugins` lists configured plugins whose payload failed verification and are quarantined for this boot.",
+    "`secrets` lists SecretRef owners that could not resolve; only counts and redacted reasons are returned, never secret values or reference keys.",
+    "`state.wal` reports the state database's WAL checkpoint health (`state`, `warning`, byte/frame counts, `consecutiveBlocked`); null when no database handle is open.",
+    "Use it to self-diagnose after a degraded start, a missing credential, or a stuck checkpoint before attempting a fix.",
   ].join(" ");
 }

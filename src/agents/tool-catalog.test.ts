@@ -156,6 +156,7 @@ describe("tool-catalog", () => {
       "gateway",
       "plugins",
       "self_status",
+      "runtime_diagnostics",
       "get_goal",
       "create_goal",
       "update_goal",

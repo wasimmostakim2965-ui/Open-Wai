@@ -249,6 +249,12 @@ describe("openclaw-tools progress_card gating", () => {
     expect(hasTool(tools, "self_status")).toBe(true);
     expect(expectToolNamed(tools, "self_status").description).toMatch(/install kind/i);
   });
+
+  it("registers the runtime_diagnostics health tool for the primary agent", () => {
+    const tools = createTestOpenClawTools({ agentSessionKey: "agent:main:main" });
+    expect(hasTool(tools, "runtime_diagnostics")).toBe(true);
+    expect(expectToolNamed(tools, "runtime_diagnostics").description).toMatch(/runtime health/i);
+  });
 });
 
 function hasTool(tools: readonly { name: string }[], name: string): boolean {

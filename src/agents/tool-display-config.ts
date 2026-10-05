@@ -285,6 +285,7 @@ export const TOOL_DISPLAY_CONFIG: ToolDisplayConfig = {
     },
     agents_list: displayTool("🧭", "Agents", []),
     self_status: displayTool("🧬", "Self Status", []),
+    runtime_diagnostics: displayTool("🩺", "Runtime Diagnostics", []),
     memory_search: displayTool("🧠", "Memory Search", ["query"]),
     memory_get: displayTool("📓", "Memory Get", ["path", "from", "lines"]),
     skills_search: displayTool("🔍", "Skill Search", ["query"]),

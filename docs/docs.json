@@ -1953,7 +1953,8 @@
                       "tools/exec-approvals-advanced",
                       "tools/permission-modes",
                       "tools/secrets",
-                      "tools/self-status"
+                      "tools/self-status",
+                      "tools/runtime-diagnostics"
                     ]
                   },
                   {

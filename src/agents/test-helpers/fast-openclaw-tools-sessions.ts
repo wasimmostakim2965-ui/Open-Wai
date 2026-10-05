@@ -15,6 +15,10 @@ vi.mock("../tools/self-status-tool.js", () => ({
   createSelfStatusTool: () => stubTool("self_status"),
 }));
 
+vi.mock("../tools/runtime-diagnostics-tool.js", () => ({
+  createRuntimeDiagnosticsTool: () => stubTool("runtime_diagnostics"),
+}));
+
 vi.mock("../tools/computer-tool.js", () => ({
   createComputerTool: () => stubTool("computer"),
 }));

@@ -432,6 +432,13 @@ const CORE_TOOL_DEFINITIONS: CoreToolDefinition[] = [
     includeInOpenClawGroup: true,
   },
   {
+    id: "runtime_diagnostics",
+    description: "Report the agent's own runtime health: degraded plugins, secrets, and WAL state",
+    sectionId: "runtime",
+    profiles: ["coding"],
+    includeInOpenClawGroup: true,
+  },
+  {
     id: "get_goal",
     description: "Get current thread goal",
     sectionId: "agents",

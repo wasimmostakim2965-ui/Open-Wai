@@ -69,6 +69,7 @@ import { createNodesTool } from "./tools/nodes-tool.js";
 import { createPdfTool } from "./tools/pdf-tool.js";
 import { createAvailablePortalTools } from "./tools/portal-tool.js";
 import { createProgressCardTool } from "./tools/progress-card-tool.js";
+import { createRuntimeDiagnosticsTool } from "./tools/runtime-diagnostics-tool.js";
 import { createScreenTool } from "./tools/screen-tool.js";
 import { createSecretsTool } from "./tools/secrets-tool.js";
 import { createSelfStatusTool } from "./tools/self-status-tool.js";
@@ -400,6 +401,7 @@ export function createOpenClawTools(options?: OpenClawToolsOptions): AnyAgentToo
       requesterAgentIdOverride: sessionAgentId,
     }),
     createSelfStatusTool(),
+    createRuntimeDiagnosticsTool(),
     ...[createGetGoalTool, createCreateGoalTool, createUpdateGoalTool].map((createTool) =>
       createTool({ ...options, sessionAgentId }),
     ),
