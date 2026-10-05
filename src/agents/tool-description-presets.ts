@@ -17,6 +17,8 @@ export const SESSIONS_SPAWN_TOOL_DISPLAY_SUMMARY =
 export const SESSIONS_SPAWN_SUBAGENT_TOOL_DISPLAY_SUMMARY = "Spawn subagent session.";
 export const AGENTS_WAIT_TOOL_DISPLAY_SUMMARY = "Wait for collector subagents.";
 export const SESSION_STATUS_TOOL_DISPLAY_SUMMARY = "Show session status/model/usage.";
+export const SELF_STATUS_TOOL_DISPLAY_SUMMARY =
+  "Report this install's version, build, source checkout, and update availability.";
 export const ASK_USER_TOOL_DISPLAY_SUMMARY = "Ask the user and wait for an answer.";
 export const SUGGEST_TASK_TOOL_DISPLAY_SUMMARY = "Suggest follow-up work for operator approval.";
 export const DISMISS_TASK_TOOL_DISPLAY_SUMMARY = "Withdraw a pending task suggestion.";
@@ -194,5 +196,15 @@ export function describeSecretsTool(): string {
     "Gateway egress only: enabled proxy + exact allowedHosts required; no hosts blocks egress, not config refs. No plaintext fallback.",
     SECRET_EGRESS_USAGE_PROMPT,
     "Operator-set env entries are readable and managed separately from this protected store. no_answer means no credential was supplied.",
+  ].join(" ");
+}
+
+/** Describes the self_status tool: the running install's own identity and updates. */
+export function describeSelfStatusTool(): string {
+  return [
+    "Report the running install's own identity: version, build id, loaded commit, install kind (git source checkout, package, host, unknown), package manager, install root, and update channel.",
+    "Use it before self-modifying work to learn whether the agent runs from a source checkout it can edit, and which update channel it follows.",
+    "Set `refresh` true to fetch remote git/npm state and report whether an update is available (`updateAvailable`, `git.behind`, `registry.latestVersion`, `hint`); refresh is slower because it uses the network.",
+    "Default (no refresh) reports local identity only and never contacts the network.",
   ].join(" ");
 }

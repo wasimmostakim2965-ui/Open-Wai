@@ -7,7 +7,12 @@ import type { UpdateInstallKind } from "./update-install-kind.js";
 /** Release stream used to choose registry tags and update policy defaults. */
 export type UpdateChannel = "stable" | "extended-stable" | "beta" | "dev";
 /** Evidence source that decided the effective update channel. */
-type UpdateChannelSource = "config" | "git-tag" | "git-branch" | "installed-version" | "default";
+export type UpdateChannelSource =
+  | "config"
+  | "git-tag"
+  | "git-branch"
+  | "installed-version"
+  | "default";
 
 /** Default channel for npm/package installs when no config or version signal overrides it. */
 export const DEFAULT_PACKAGE_CHANNEL: UpdateChannel = "stable";

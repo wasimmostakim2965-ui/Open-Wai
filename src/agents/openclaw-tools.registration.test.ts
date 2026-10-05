@@ -243,6 +243,12 @@ describe("openclaw-tools progress_card gating", () => {
       }),
     ).toBe(false);
   });
+
+  it("registers the self_status identity tool for the primary agent", () => {
+    const tools = createTestOpenClawTools({ agentSessionKey: "agent:main:main" });
+    expect(hasTool(tools, "self_status")).toBe(true);
+    expect(expectToolNamed(tools, "self_status").description).toMatch(/install kind/i);
+  });
 });
 
 function hasTool(tools: readonly { name: string }[], name: string): boolean {

@@ -71,6 +71,7 @@ import { createAvailablePortalTools } from "./tools/portal-tool.js";
 import { createProgressCardTool } from "./tools/progress-card-tool.js";
 import { createScreenTool } from "./tools/screen-tool.js";
 import { createSecretsTool } from "./tools/secrets-tool.js";
+import { createSelfStatusTool } from "./tools/self-status-tool.js";
 import { createSessionStatusTool } from "./tools/session-status-tool.js";
 import { createSessionsHistoryTool } from "./tools/sessions-history-tool.js";
 import { createSessionsListTool } from "./tools/sessions-list-tool.js";
@@ -398,6 +399,7 @@ export function createOpenClawTools(options?: OpenClawToolsOptions): AnyAgentToo
       agentSessionKey: options?.agentSessionKey,
       requesterAgentIdOverride: sessionAgentId,
     }),
+    createSelfStatusTool(),
     ...[createGetGoalTool, createCreateGoalTool, createUpdateGoalTool].map((createTool) =>
       createTool({ ...options, sessionAgentId }),
     ),

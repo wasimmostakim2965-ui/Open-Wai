@@ -425,6 +425,13 @@ const CORE_TOOL_DEFINITIONS: CoreToolDefinition[] = [
     includeInOpenClawGroup: true,
   },
   {
+    id: "self_status",
+    description: "Report this install's own identity, source checkout, and update availability",
+    sectionId: "runtime",
+    profiles: ["coding"],
+    includeInOpenClawGroup: true,
+  },
+  {
     id: "get_goal",
     description: "Get current thread goal",
     sectionId: "agents",

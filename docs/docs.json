@@ -1952,7 +1952,8 @@
                       "tools/exec-approvals",
                       "tools/exec-approvals-advanced",
                       "tools/permission-modes",
-                      "tools/secrets"
+                      "tools/secrets",
+                      "tools/self-status"
                     ]
                   },
                   {
