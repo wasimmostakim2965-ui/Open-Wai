@@ -12,6 +12,20 @@ Update instructions at their owner instead of adding competing rules here.
 - This repository (`wasimmostakim2965-ui/Open-Wai`) is the agent's **canonical source**. The box the agent runs on is a copy of it, and it is where every change to the agent itself must live.
 - Any change to the agent's own source, architecture, backend logic, or tooling must be **verified locally and then pushed to this repository**. A self-change is not complete until the same change exists on the remote: a local-only edit is unfinished work, not a finished one.
 - Push proven changes directly to `main` (no pull request) with a clear commit message, then confirm the remote ref advanced (`git ls-remote origin refs/heads/main`). Never push a change whose build or relevant tests are red.
+- **Every self-change follows the mandatory [self-change loop](.agents/skills/self-change-loop/SKILL.md)**, and no step is skipped: (1) stage the change off `main` on a throwaway branch or isolated worktree; (2) verify there with `pnpm build` + the relevant `vitest` and, when feasible, by running the real behavior; (3) apply it to the live source only when green; (4) push that same change to this repository; (5) if it breaks something, revert the commit and push the revert — never stay silent. Report every push as **what changed | files | tests | commit sha**.
+
+## Auto-update chain (repository → running agent)
+
+A push to this repository must reach the running agent through the owner of that install. Verify the path; do not invent a second deployer or scheduler.
+
+- **Source checkout (this box).** The agent runs from a clone of this repository, so a pushed change arrives by fast-forwarding the checkout and rebuilding:
+  ```bash
+  git fetch origin && git merge --ff-only origin/main
+  corepack pnpm build
+  ```
+  Run this through the [self-change loop](.agents/skills/self-change-loop/SKILL.md) / [openclaw-update](.agents/skills/openclaw-update/SKILL.md) owner. `openclaw update` on a source checkout follows the same fetch-and-rebuild contract; `update.channel: "dev"` tracks `main`.
+- **Managed install (packaged node/service).** Automatic updates are owner-managed and **on by default** for long-running packaged nodes; they check hourly and activate only when idle. The config keys are `update.channel` (`stable` | `extended-stable` | `beta` | `dev`), `update.checkOnStart`, and `update.auto.enabled` (all optional). There is **no interval key** — the hourly cadence is fixed. Ensure the operator config (`~/.openclaw/openclaw.json`) carries `update.auto.enabled: true` (or omits it to keep the default) and `update.channel` set to the intended line; report any missing or contradicting value rather than guessing. See [Automatic updates](docs/install/updating/automatic-updates.md).
+- A source checkout and a `dev` install are owner-managed and are **not** replaced by node auto-update; bring them forward with the fetch-and-rebuild path above.
 
 ## Design priorities
 
