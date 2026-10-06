@@ -9,8 +9,28 @@ OpenClaw changes itself through one ordered loop. Every step is mandatory; a
 self-change is not complete until the last one passes. This skill is the
 procedure; `AGENTS.md` ("Canonical source and self-changes") is the hard rule.
 
+## Credential
+
+The agent owns the canonical repository through its **own** credential, not the
+host's. `origin` is `https://github.com/wasimmostakim2965-ui/Open-Wai.git`, and
+the token lives only in the git credential store (`credential.helper = store`,
+`~/.git-credentials`). Never put a token in a file, log, commit message, or the
+remote URL, and never print it.
+
+Confirm the credential can actually push before trusting a land:
+
+```bash
+node .agents/skills/self-change-loop/scripts/preflight.mjs
+```
+
+It asserts `origin` is the canonical repo, reports the helper, and dry-runs the
+push (`git push --dry-run`), so a missing or stale credential fails here rather
+than after a verified build.
+
 ## The loop
 
+0. **Preflight.** Run the credential check above. If it fails, fix the
+   credential first; do not start a change you cannot land.
 1. **Stage off main.** Write the change on a throwaway branch or an isolated
    worktree, never directly in the live `main` tree:
    ```bash
@@ -26,7 +46,9 @@ procedure; `AGENTS.md` ("Canonical source and self-changes") is the hard rule.
    corepack pnpm exec vitest run <changed-file>.test.ts ...
    ```
    Exercise the real behavior directly when feasible (run the CLI/flow), not just
-   the unit boundary. Docs-only: docs sanity plus `git diff --check`.
+   the unit boundary. Docs-only: docs sanity plus `git diff --check`. This is an
+   incremental `pnpm` build with warm caches, not a from-scratch recompile —
+   rebuild only what changed.
 3. **Apply to live source only when green.** Bring the verified change into the
    live checkout (`main`) by fast-forward/merge or re-applying the same diff.
    Never hand-edit the live tree with an unverified change.
