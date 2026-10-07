@@ -71,10 +71,13 @@ jobs:
         run: |
           set -euo pipefail
           # The GUI ships from the committed frontend, so no `beforeBuildCommand`.
+          # Tauri's JSON-merge override replaces arrays, so `icon` is restated in
+          # full here: the Windows bundlers (nsis/msi) require an `.ico`, which the
+          # base Linux config does not list even though `icons/icon.ico` ships.
           # `createUpdaterArtifacts:false` keeps the build keyless; a signed
           # updater bundle is a release-only concern owned by linux-app-release.yml.
           pnpm dlx @tauri-apps/cli@2.11.4 build --bundles nsis,msi \
-            --config "{\"identifier\":\"ai.openclaw.windows\",\"bundle\":{\"createUpdaterArtifacts\":false}}"
+            --config "{\"identifier\":\"ai.openclaw.windows\",\"bundle\":{\"createUpdaterArtifacts\":false,\"icon\":[\"icons/32x32.png\",\"icons/128x128.png\",\"icons/128x128@2x.png\",\"icons/icon.png\",\"icons/icon.ico\"]}}"
 
       - name: Stage installers
         shell: pwsh
