@@ -1,0 +1,127 @@
+name: Build Windows Hub
+
+# Manual workflow that builds the REAL OpenClaw Windows GUI -- the WinUI
+# "OpenClaw Companion" tray app -- and produces a runnable installer `.exe`.
+#
+# The desktop GUI for Windows is NOT the Tauri shell under `apps/linux/src-tauri`
+# in this repository. Upstream ships Windows through a separate C#/WinUI project:
+#   https://github.com/openclaw/openclaw-windows-node  ("Windows companion suite")
+# Its release installer is `OpenClawCompanion-Setup-x64.exe`, built with Inno
+# Setup. This repository consumes that product through
+# `.github/workflows/windows-node-release.yml`, which promotes the signed
+# installers from that repo's releases. This workflow reproduces that build
+# directly from source (unsigned, for local/testing use) using the same steps as
+# the `build-x64` and `prepare-release-assets` jobs in that repo's `ci.yml`.
+#
+# Requirements mirrored from openclaw-windows-node/DEVELOPMENT.md:
+#   .NET SDK 10.0.400+, Node.js LTS with npm (the WinUI build runs `npm ci` to
+#   restore @microsoft/mxc-sdk), the Windows 10 SDK, and Inno Setup 6.
+#
+# Output: an unsigned `OpenClawCompanion-Setup-x64.exe` artifact. For signed,
+# notarized releases use the upstream `openclaw-windows-node` release pipeline.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-hub-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  WINDOWS_NODE_REPO: openclaw/openclaw-windows-node
+  WINDOWS_NODE_REF: main
+  # Inno Setup AppVersion. The app's own assembly version comes from GitVersion;
+  # this is the installer's Add/Remove Programs version for this test build.
+  APP_VERSION: "0.1.0"
+
+jobs:
+  build-windows-hub:
+    name: Build Windows Hub installer (.exe)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout OpenClaw Windows Hub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.WINDOWS_NODE_REPO }}
+          ref: ${{ env.WINDOWS_NODE_REF }}
+          # GitVersion needs history and tags to compute the assembly version.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Publish WinUI tray app (x64)
+        shell: pwsh
+        run: |
+          dotnet publish src/OpenClaw.Tray.WinUI -c Release -r win-x64 --self-contained -o publish
+
+      - name: Download Visual C++ runtime redistributable
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://aka.ms/vc14/vc_redist.x64.exe" -OutFile "vc_redist.x64.exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath "vc_redist.x64.exe"
+          if ($signature.Status -ne "Valid") {
+            throw "vc_redist.x64.exe Authenticode signature was $($signature.Status)."
+          }
+          $subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { "" }
+          if ($subject -notmatch "O=Microsoft Corporation") {
+            throw "vc_redist.x64.exe signer was not Microsoft Corporation: $subject"
+          }
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            /DMyAppVersion=${{ env.APP_VERSION }} `
+            /DMyAppArch=x64 `
+            /Dpublish=publish `
+            /DvcRedist=vc_redist.x64.exe `
+            installer.iss
+
+      - name: Verify and stage installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installers = @(Get-ChildItem "Output/OpenClawCompanion-Setup-x64.exe" -ErrorAction SilentlyContinue)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one installer at Output/OpenClawCompanion-Setup-x64.exe; found $($installers.Count)."
+          }
+          $installer = $installers[0]
+          $bytes = [System.IO.File]::ReadAllBytes($installer.FullName)
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "'$($installer.Name)' is not a Windows PE executable (missing MZ header)."
+          }
+          New-Item -ItemType Directory -Force -Path "dist/windows-hub" | Out-Null
+          Copy-Item -LiteralPath $installer.FullName -Destination "dist/windows-hub/OpenClawCompanion-Setup-x64.exe"
+          Write-Host ("staged OpenClawCompanion-Setup-x64.exe ({0:N0} bytes)" -f $installer.Length)
+
+      - name: Upload installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: OpenClawCompanion-Setup-x64
+          path: dist/windows-hub/OpenClawCompanion-Setup-x64.exe
+          if-no-files-found: error
+          retention-days: 14
