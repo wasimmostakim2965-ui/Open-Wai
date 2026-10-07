@@ -1342,6 +1342,7 @@ Environment variables:
   OPENCLAW_BETA=0|1
   OPENCLAW_GIT_DIR=...
   OPENCLAW_GIT_UPDATE=0|1
+  OPENCLAW_GIT_REPO_URL=...           Git checkout source (default: the official OpenClaw repository)
   OPENCLAW_NO_PROMPT=1
   OPENCLAW_VERIFY_INSTALL=1
   OPENCLAW_DRY_RUN=1
@@ -3062,7 +3063,7 @@ publish_executable_wrapper() {
 
 install_openclaw_from_git() {
     local repo_dir="$1"
-    local repo_url="https://github.com/openclaw/openclaw.git"
+    local repo_url="${OPENCLAW_GIT_REPO_URL:-https://github.com/openclaw/openclaw.git}"
 
     mkdir -p "$(dirname "$repo_dir")"
     if [[ -d "$repo_dir" ]]; then

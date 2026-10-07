@@ -131,6 +131,7 @@ NPM_LOGLEVEL="${OPENCLAW_NPM_LOGLEVEL:-error}"
 INSTALL_METHOD="${OPENCLAW_INSTALL_METHOD:-npm}"
 GIT_DIR="${OPENCLAW_GIT_DIR:-${OPENCLAW_EFFECTIVE_HOME}/openclaw}"
 GIT_UPDATE="${OPENCLAW_GIT_UPDATE:-1}"
+GIT_REPO_URL="${OPENCLAW_GIT_REPO_URL:-https://github.com/openclaw/openclaw.git}"
 JSON=0
 RUN_ONBOARD=0
 NODE_ONLY=0
@@ -166,6 +167,7 @@ Environment variables:
   OPENCLAW_VERSION=latest|next|<semver>
   OPENCLAW_GIT_DIR=...
   OPENCLAW_GIT_UPDATE=0|1
+  OPENCLAW_GIT_REPO_URL=...           Git checkout source (default: the official OpenClaw repository)
 EOF
 }
 
@@ -1335,7 +1337,7 @@ ensure_pnpm_git_prepare_allowlist() {
 
 install_openclaw_from_git() {
   local repo_dir="$1"
-  local repo_url="https://github.com/openclaw/openclaw.git"
+  local repo_url="${GIT_REPO_URL:-https://github.com/openclaw/openclaw.git}"
   local fresh_checkout=0
 
   if [[ -z "$repo_dir" ]]; then
