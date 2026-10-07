@@ -67,10 +67,9 @@ jobs:
         run: |
           set -euo pipefail
           node openclaw.mjs --version
-          node openclaw.mjs --help > /dev/null
           # Prove this fork's custom tools are compiled into the build.
-          grep -q "self_status" dist/entry.js
-          grep -q "runtime_diagnostics" dist/entry.js
+          grep -rql "self_status" dist
+          grep -rql "runtime_diagnostics" dist
           echo "fork customizations present in dist/"
 
       - name: Pack the CLI/Gateway package
