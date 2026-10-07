@@ -1,0 +1,98 @@
+name: Build Windows Agent
+
+# Manual workflow that builds THIS repository's OpenClaw agent (CLI + Gateway)
+# for Windows, so the fork's customizations are actually inside the artifact.
+#
+# Important: the `OpenClawCompanion-Setup-x64.exe` installer from
+# `openclaw/openclaw-windows-node` (see `build-windows-hub.yml`) is the upstream
+# Windows GUI. It does NOT contain this fork's agent -- it connects to an
+# OpenClaw Gateway that you install separately. To run OUR agent on Windows you
+# need this repo's CLI/Gateway, which is what this workflow produces.
+#
+# The output is a real Windows artifact of our own code:
+#   - `openclaw-<version>.tgz`  -- the packed CLI/Gateway npm package
+#     (`openclaw.mjs` + `dist/`, containing our `self_status`,
+#     `runtime_diagnostics`, apply_patch default, Claws CLI, and bundled-plugin
+#     defaults). Install it on Windows with:
+#         npm install -g ./openclaw-<version>.tgz
+#         openclaw --version
+#     or install straight from this repo with
+#         iwr -useb https://openclaw.ai/install.ps1 | iex
+#     (the `git` method is hardcoded to openclaw/openclaw, so use the tarball).
+#   - `openclaw-dist` -- the built `dist/` tree, for inspection or packaging.
+#
+# There is no upstream "openclaw.exe" standalone binary for the agent; OpenClaw
+# runs on Node (>=24.16 <25 || >=26.1) and is distributed as this npm package.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build-windows-agent:
+    name: Build Windows agent package
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile --prefer-offline \
+            --config.ignore-scripts=false --config.engine-strict=false \
+            --config.enable-pre-post-scripts=true --config.side-effects-cache=true
+
+      - name: Build agent (JS runtime + Control UI)
+        shell: bash
+        run: pnpm build
+
+      - name: Smoke test the built CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          node openclaw.mjs --version
+          node openclaw.mjs --help > /dev/null
+          # Prove this fork's custom tools are compiled into the build.
+          grep -q "self_status" dist/entry.js
+          grep -q "runtime_diagnostics" dist/entry.js
+          echo "fork customizations present in dist/"
+
+      - name: Pack the CLI/Gateway package
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --ignore-scripts
+          ls -la openclaw-*.tgz
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/windows-agent
+          cp openclaw-*.tgz dist/windows-agent/
+          cp -r dist dist/windows-agent/openclaw-dist
+          ls -la dist/windows-agent/
+
+      - name: Upload agent package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openclaw-windows-agent
+          path: dist/windows-agent/*
+          if-no-files-found: error
+          retention-days: 14
