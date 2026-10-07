@@ -1,15 +1,20 @@
 name: Build Windows App
 
-# Manual workflow that produces the OpenClaw desktop GUI installers for Windows.
+# Manual workflow that produces a directly runnable Windows `.exe` installer.
 #
-# The desktop shell is the Tauri v2 app under `apps/linux/src-tauri`. That crate
-# carries Windows-specific code paths (for example `gateway_windows.rs` and the
-# `cfg(target_os = "windows")` branches), and the committed `apps/linux/ui`
-# frontend plus the bundled fonts are the app's `frontendDist`, so no separate
-# UI copy step is required for the shell itself. There is no `apps/windows`
-# directory; the Windows flavour is produced by overriding the Tauri config on
-# the command line (identifier + keyless bundle), matching the proven
-# `build_windows` job in `.github/workflows/linux-app-release.yml`.
+# The desktop shell is the Tauri v2 app under `apps/linux/src-tauri`. Its
+# `frontendDist` is the committed `apps/linux/ui` frontend plus the bundled
+# fonts, so the installer only needs `tauri build` -- there is no separate
+# frontend build step, and the app never loads `dist/` (the JS runtime /
+# Control UI bundles are a Gateway concern, not this desktop shell). That is
+# also why the shell stays small: it is a thin companion that installs and
+# manages the OpenClaw CLI/Gateway at runtime; it does not embed a Node runtime.
+#
+# The Windows flavour is produced by overriding the Tauri config on the command
+# line, matching the proven `build_windows` job in
+# `.github/workflows/linux-app-release.yml`. `--bundles nsis` emits a single
+# self-contained NSIS installer `.exe`; no MSI is produced, so the artifact
+# download is the runnable `.exe` itself rather than an archive of both formats.
 on:
   workflow_dispatch:
 
@@ -21,9 +26,9 @@ env:
 
 jobs:
   build-windows:
-    name: Build Windows GUI installers
+    name: Build Windows installer (.exe)
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,43 +66,40 @@ jobs:
             --config.ignore-scripts=false --config.engine-strict=false \
             --config.enable-pre-post-scripts=true --config.side-effects-cache=true
 
-      - name: Build JS runtime and Control UI bundles
-        shell: bash
-        run: pnpm build
-
-      - name: Build Windows Tauri bundle
-        working-directory: apps/linux/src-tauri
+      - name: Build Windows installer
         shell: bash
         run: |
           set -euo pipefail
-          # The GUI ships from the committed frontend, so no `beforeBuildCommand`.
           # Tauri's JSON-merge override replaces arrays, so `icon` is restated in
-          # full here: the Windows bundlers (nsis/msi) require an `.ico`, which the
-          # base Linux config does not list even though `icons/icon.ico` ships.
+          # full: the NSIS bundler requires an `.ico`, which the base Linux config
+          # does not list even though `icons/icon.ico` ships in the repo.
           # `createUpdaterArtifacts:false` keeps the build keyless; a signed
           # updater bundle is a release-only concern owned by linux-app-release.yml.
-          pnpm dlx @tauri-apps/cli@2.11.4 build --bundles nsis,msi \
+          pnpm dlx @tauri-apps/cli@2.11.4 build --bundles nsis \
             --config "{\"identifier\":\"ai.openclaw.windows\",\"bundle\":{\"createUpdaterArtifacts\":false,\"icon\":[\"icons/32x32.png\",\"icons/128x128.png\",\"icons/128x128@2x.png\",\"icons/icon.png\",\"icons/icon.ico\"]}}"
 
-      - name: Stage installers
+      - name: Verify and stage installer
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $nsis = @(Get-ChildItem "apps/linux/src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue)
-          $msi = @(Get-ChildItem "apps/linux/src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue)
-          if ($nsis.Count -eq 0 -and $msi.Count -eq 0) {
-            throw "No Windows installers were produced."
+          $installers = @(Get-ChildItem "apps/linux/src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer; found $($installers.Count)."
+          }
+          $installer = $installers[0]
+          $bytes = [System.IO.File]::ReadAllBytes($installer.FullName)
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "'$($installer.Name)' is not a Windows PE executable (missing MZ header)."
           }
           New-Item -ItemType Directory -Force -Path "dist/windows-app" | Out-Null
-          foreach ($file in @($nsis) + @($msi)) {
-            Copy-Item -LiteralPath $file.FullName -Destination "dist/windows-app/$($file.Name)"
-            Write-Host ("staged {0} ({1:N0} bytes)" -f $file.Name, $file.Length)
-          }
+          $destination = "dist/windows-app/OpenClaw-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination $destination
+          Write-Host ("staged {0} ({1:N0} bytes)" -f $destination, $installer.Length)
 
-      - name: Upload installers
+      - name: Upload installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: openclaw-windows-installers
-          path: dist/windows-app/*
+          name: OpenClaw-windows-x64-setup
+          path: dist/windows-app/OpenClaw-windows-x64-setup.exe
           if-no-files-found: error
           retention-days: 14
