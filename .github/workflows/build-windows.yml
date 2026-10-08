@@ -123,6 +123,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # A cached `target/` can hold installers from earlier builds (for
+          # example an older stamped version). Clear the bundle directory so the
+          # staging step below sees exactly the installer this run produced.
+          rm -rf apps/linux/src-tauri/target/release/bundle/nsis
           # Tauri's JSON-merge override replaces arrays, so `icon` is restated in
           # full: the NSIS bundler requires an `.ico`, which the base config does
           # not list even though `icons/icon.ico` ships in the repo.
@@ -135,10 +139,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $installers = @(Get-ChildItem "apps/linux/src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue)
-          if ($installers.Count -ne 1) {
-            throw "Expected exactly one NSIS installer; found $($installers.Count)."
+          if ($installers.Count -lt 1) {
+            throw "No NSIS installer was produced."
           }
-          $installer = $installers[0]
+          # If a cached bundle left more than one, stage the one this run wrote.
+          $installer = $installers | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           $bytes = [System.IO.File]::ReadAllBytes($installer.FullName)
           if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
             throw "'$($installer.Name)' is not a Windows PE executable (missing MZ header)."
