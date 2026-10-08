@@ -68,26 +68,35 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-/// Locate the CLI shim under the bundled installer's private Node runtime.
+/// Locate the CLI shim installed by the bundled installer's private runtime.
 ///
-/// The Windows installer provisions a managed Node under
-/// `%USERPROFILE%\.openclaw\tools\node*` and installs the CLI into that
-/// prefix's global bin. Returns the first `<node*>/openclaw.cmd` that exists.
+/// The installer provisions a private Node (and installs the CLI into its
+/// global prefix) under either `%USERPROFILE%\.openclaw\tools\node*` or
+/// `%LOCALAPPDATA%\OpenClaw\deps\portable-node`. The exact prefix depends on the
+/// installer path, and a freshly installed user PATH is not visible to this
+/// process, so probe those fixed locations explicitly.
 #[cfg(target_os = "windows")]
 fn managed_node_cli(openclaw_home: &std::path::Path) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
     let tools = openclaw_home.join("tools");
-    for entry in std::fs::read_dir(&tools).ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("node") {
-            continue;
-        }
-        let shim = entry.path().join("openclaw.cmd");
-        if shim.is_file() {
-            return Some(shim);
+    if let Ok(entries) = std::fs::read_dir(&tools) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("node") {
+                roots.push(entry.path());
+            }
         }
     }
-    None
+    // `tools/node` is a symlink alias of the versioned runtime on Unix-like
+    // installs; keep it as a fallback in case the versioned name is absent.
+    roots.push(tools.join("node"));
+    if let Some(local) = env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("OpenClaw\\deps\\portable-node"));
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join("openclaw.cmd"))
+        .find(|shim| shim.is_file())
 }
 
 impl OpenClawCli {

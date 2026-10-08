@@ -47,11 +47,22 @@ impl ChromeSetup {
     }
 
     pub(crate) fn start(&self, app: AppHandle) {
+        // The desktop browser runtime is only provisioned on Linux/macOS. On
+        // Windows an automatic startup attempt can never succeed, so skip it
+        // instead of recording a retry on every launch. Explicit tray and
+        // dashboard requests still run and report their result in the UI.
+        #[cfg(not(target_os = "windows"))]
         self.request(app, None, false);
+        #[cfg(target_os = "windows")]
+        let _ = app;
     }
 
     pub(crate) fn installed(&self, app: AppHandle, cli: OpenClawCli) {
+        // Same as `start`: post-install browser setup is Linux/macOS-only.
+        #[cfg(not(target_os = "windows"))]
         self.request(app, Some(cli), false);
+        #[cfg(target_os = "windows")]
+        let _ = (app, cli);
     }
 
     pub(crate) fn request_from_user(&self, app: AppHandle) {

@@ -1,3 +1,9 @@
+// Build the Windows release app as a windows-subsystem binary. Without this the
+// Tauri shell links as a console program and every launch opens a terminal
+// window (which also surfaces diagnostic `eprintln!` lines). Debug builds keep
+// the console so local logs stay visible.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod chrome_setup;
 mod cli;
 #[cfg(target_os = "linux")]
