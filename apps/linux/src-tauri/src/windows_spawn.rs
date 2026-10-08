@@ -14,13 +14,14 @@ use std::process::Command;
 pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Suppress the console window for a spawned helper process.
+///
+/// `Command::creation_flags` replaces the whole creation-flag word, so callers
+/// that need additional flags must combine them before calling this. The call
+/// sites here pass only this flag.
 #[cfg(windows)]
 pub(crate) fn hide_console_window(command: &mut Command) -> &mut Command {
     use std::os::windows::process::CommandExt;
-    // Do not overwrite flags an owner already set (for example a job-object run).
-    if command.get_creation_flags() & CREATE_NO_WINDOW == 0 {
-        command.creation_flags(command.get_creation_flags() | CREATE_NO_WINDOW);
-    }
+    command.creation_flags(CREATE_NO_WINDOW);
     command
 }
 
