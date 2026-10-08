@@ -15,9 +15,14 @@ name: Build Windows installer
 # run time via the bundled installer.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-windows.yml"
+      - "apps/linux/src-tauri/**"
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -119,3 +124,22 @@ jobs:
           path: dist/windows-app/OpenClaw-windows-x64-setup.exe
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish to the rolling release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "windows-latest"
+          $asset = "dist/windows-app/OpenClaw-windows-x64-setup.exe"
+          # One stable download link for testers. `--clobber` replaces the asset
+          # on every rebuild; the release carries no source, so it never
+          # collides with upstream version/release tags.
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "Windows installer (latest)" `
+              --notes "Automatically rebuilt from ``main``. Download **OpenClaw-windows-x64-setup.exe** and run it. This is a graphical app: opening it shows the agent UI (no terminal)."
+          }
+          gh release upload $tag $asset --clobber
+          Write-Host "https://github.com/${{ github.repository }}/releases/download/$tag/OpenClaw-windows-x64-setup.exe"
