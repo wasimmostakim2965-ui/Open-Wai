@@ -98,6 +98,8 @@ fn windows_installer_command(app: &AppHandle) -> Result<Command, String> {
     command
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(script);
+    // The GUI app must not flash a console for the installer child.
+    crate::windows_spawn::hide_console_window(&mut command);
     Ok(command)
 }
 
@@ -220,6 +222,7 @@ fn install_at(
             .args(["--install-method", "git", "--git-dir"])
             .arg(prefix.join("dev/openclaw"));
     }
+    crate::windows_spawn::hide_console_window(&mut command);
     run_installer(app, command, runtime_only, spawn)
 }
 

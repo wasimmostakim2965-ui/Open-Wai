@@ -25,11 +25,16 @@ fn build_command(executable: &PathBuf, args: &[OsString]) -> Command {
         if is_shim {
             let mut command = Command::new("cmd.exe");
             command.arg("/C").arg(executable).args(args);
+            // `cmd.exe` is a console child; without this it flashes a terminal in
+            // the GUI app on every CLI call.
+            crate::windows_spawn::hide_console_window(&mut command);
             return command;
         }
     }
     let mut command = Command::new(executable);
     command.args(args);
+    // A `.exe` CLI invoked as a console child can also open a console window.
+    crate::windows_spawn::hide_console_window(&mut command);
     command
 }
 
@@ -62,6 +67,28 @@ impl fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+/// Locate the CLI shim under the bundled installer's private Node runtime.
+///
+/// The Windows installer provisions a managed Node under
+/// `%USERPROFILE%\.openclaw\tools\node*` and installs the CLI into that
+/// prefix's global bin. Returns the first `<node*>/openclaw.cmd` that exists.
+#[cfg(target_os = "windows")]
+fn managed_node_cli(openclaw_home: &std::path::Path) -> Option<PathBuf> {
+    let tools = openclaw_home.join("tools");
+    for entry in std::fs::read_dir(&tools).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("node") {
+            continue;
+        }
+        let shim = entry.path().join("openclaw.cmd");
+        if shim.is_file() {
+            return Some(shim);
+        }
+    }
+    None
+}
 
 impl OpenClawCli {
     pub fn discover() -> Result<Self, CliError> {
@@ -103,6 +130,14 @@ impl OpenClawCli {
                 if npm_shim.is_file() {
                     return Ok(Self::new(npm_shim, home));
                 }
+            }
+            // The bundled installer provisions a private Node runtime and installs
+            // the CLI into its global prefix. When the installer does not publish a
+            // `~/.local\bin` wrapper, the shim lands here, so probe the managed
+            // prefix and every `node*` sibling (the prefix name carries the Node
+            // version) before giving up and reporting the CLI as missing.
+            if let Some(managed) = managed_node_cli(&home) {
+                return Ok(Self::new(managed, home));
             }
         }
 

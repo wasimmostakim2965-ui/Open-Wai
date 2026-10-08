@@ -32,6 +32,7 @@ mod quickchat_widgets;
 mod remote_gateway;
 mod tray;
 mod updater;
+mod windows_spawn;
 mod window_chrome;
 #[cfg(target_os = "linux")]
 mod window_chrome_linux;

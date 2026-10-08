@@ -1055,6 +1055,7 @@ pub(crate) fn start_tunnel(
         })?;
 
     let mut command = Command::new(executable);
+    crate::windows_spawn::hide_console_window(&mut command);
     command.args([
         "-N",
         "-L",

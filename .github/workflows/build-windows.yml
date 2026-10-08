@@ -88,6 +88,37 @@ jobs:
           cp openclaw-*.tgz apps/linux/src-tauri/target/installers/openclaw.tgz
           ls -la apps/linux/src-tauri/target/installers/
 
+      - name: Stamp the release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `is_release_version` in main.rs treats the committed 0.1.0 as a
+          # development build, which routes the app into its "Choose a release
+          # channel" dev flow. Stamp a release version so the app treats itself
+          # as a normal GUI build and installs straight to the chat board.
+          version="$(node -p "require('./package.json').version")"
+          if [ -z "$version" ] || [ "$version" = "0.1.0" ]; then
+            echo "unexpected package version: '$version'" >&2
+            exit 1
+          fi
+          echo "Stamping app version $version"
+          node -e '
+            const fs = require("fs");
+            const version = process.argv[1];
+            for (const file of ["apps/linux/src-tauri/tauri.conf.json", "apps/linux/src-tauri/Cargo.toml"]) {
+              let text = fs.readFileSync(file, "utf8");
+              if (file.endsWith(".json")) {
+                const data = JSON.parse(text);
+                data.version = version;
+                fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+              } else {
+                text = text.replace(/^version = ".*"$/m, `version = "${version}"`);
+                fs.writeFileSync(file, text);
+              }
+            }
+          ' "$version"
+          grep -m1 '"version"' apps/linux/src-tauri/tauri.conf.json
+
       - name: Build Windows installer
         shell: bash
         run: |
