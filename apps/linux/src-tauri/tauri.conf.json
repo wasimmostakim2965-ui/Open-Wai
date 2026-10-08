@@ -122,7 +122,8 @@
       "icons/icon.png"
     ],
     "resources": {
-      "target/installers/install-cli.sh": "install-cli.sh"
+      "target/installers/install-cli.sh": "install-cli.sh",
+      "target/installers/install.ps1": "install.ps1"
     },
     "linux": {
       "appimage": {

@@ -8,6 +8,13 @@ fn main() {
     );
     std::fs::create_dir_all("target/installers").expect("installer output directory");
     std::fs::write("target/installers/install-cli.sh", installer).expect("standalone installer");
+    // The Windows installer is a bundled resource on every platform so the same
+    // `tauri.conf.json` builds everywhere; only the Windows shell runs it.
+    std::fs::write(
+        "target/installers/install.ps1",
+        include_str!("../../../scripts/install.ps1"),
+    )
+    .expect("windows installer");
     const COMMANDS: &[&str] = &[
         "bootstrap",
         "build_info",

@@ -1,20 +1,18 @@
-name: Build Windows App
+name: Build Windows installer
 
-# Manual workflow that produces a directly runnable Windows `.exe` installer.
+# Produces ONE directly runnable, graphical Windows installer for THIS fork.
+#
+#   OpenClaw-windows-x64-setup.exe
 #
 # The desktop shell is the Tauri v2 app under `apps/linux/src-tauri`. Its
-# `frontendDist` is the committed `apps/linux/ui` frontend plus the bundled
-# fonts, so the installer only needs `tauri build` -- there is no separate
-# frontend build step, and the app never loads `dist/` (the JS runtime /
-# Control UI bundles are a Gateway concern, not this desktop shell). That is
-# also why the shell stays small: it is a thin companion that installs and
-# manages the OpenClaw CLI/Gateway at runtime; it does not embed a Node runtime.
+# `frontendDist` is the committed `apps/linux/ui` frontend, so `tauri build`
+# needs no separate frontend step. `--bundles nsis` emits a single
+# self-contained NSIS installer `.exe` (no MSI, no zip of folders).
 #
-# The Windows flavour is produced by overriding the Tauri config on the command
-# line, matching the proven `build_windows` job in
-# `.github/workflows/linux-app-release.yml`. `--bundles nsis` emits a single
-# self-contained NSIS installer `.exe`; no MSI is produced, so the artifact
-# download is the runnable `.exe` itself rather than an archive of both formats.
+# Running the installer places a normal Windows app; opening it shows a native
+# window that loads the agent's Control UI (the graphical chat/dashboard). There
+# is no terminal. The shell installs and supervises this fork's CLI/Gateway at
+# run time via the bundled installer.
 on:
   workflow_dispatch:
 
@@ -66,17 +64,35 @@ jobs:
             --config.ignore-scripts=false --config.engine-strict=false \
             --config.enable-pre-post-scripts=true --config.side-effects-cache=true
 
+      - name: Build the agent package (this fork)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm build
+          npm pack --ignore-scripts
+          ls -la openclaw-*.tgz
+
+      - name: Stage the bundled agent package
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The Windows shell installs this fork's agent from the packaged tarball
+          # bundled as the `openclaw.tgz` resource (offline, single-shot). The
+          # `target/installers/*.sh`/`*.ps1` resources are written by build.rs.
+          mkdir -p apps/linux/src-tauri/target/installers
+          cp openclaw-*.tgz apps/linux/src-tauri/target/installers/openclaw.tgz
+          ls -la apps/linux/src-tauri/target/installers/
+
       - name: Build Windows installer
         shell: bash
         run: |
           set -euo pipefail
           # Tauri's JSON-merge override replaces arrays, so `icon` is restated in
-          # full: the NSIS bundler requires an `.ico`, which the base Linux config
-          # does not list even though `icons/icon.ico` ships in the repo.
-          # `createUpdaterArtifacts:false` keeps the build keyless; a signed
-          # updater bundle is a release-only concern owned by linux-app-release.yml.
+          # full: the NSIS bundler requires an `.ico`, which the base config does
+          # not list even though `icons/icon.ico` ships in the repo.
+          # `createUpdaterArtifacts:false` keeps this build keyless.
           pnpm dlx @tauri-apps/cli@2.11.4 build --bundles nsis \
-            --config "{\"identifier\":\"ai.openclaw.windows\",\"bundle\":{\"createUpdaterArtifacts\":false,\"icon\":[\"icons/32x32.png\",\"icons/128x128.png\",\"icons/128x128@2x.png\",\"icons/icon.png\",\"icons/icon.ico\"]}}"
+            --config "{\"identifier\":\"ai.openclaw.windows\",\"bundle\":{\"createUpdaterArtifacts\":false,\"resources\":{\"target/installers/install-cli.sh\":\"install-cli.sh\",\"target/installers/install.ps1\":\"install.ps1\",\"target/installers/openclaw.tgz\":\"openclaw.tgz\"},\"icon\":[\"icons/32x32.png\",\"icons/128x128.png\",\"icons/128x128@2x.png\",\"icons/icon.png\",\"icons/icon.ico\"]}}"
 
       - name: Verify and stage installer
         shell: pwsh

@@ -13,6 +13,26 @@ use std::time::{Duration, Instant};
 
 pub(crate) type SpawnCommand<'a> = dyn Fn(&mut Command) -> Result<Child, String> + 'a;
 
+/// Build a command for the resolved CLI executable. On Windows the installer
+/// places a `openclaw.cmd` shim, which CreateProcess cannot execute directly, so
+/// route it through `cmd.exe /C`.
+fn build_command(executable: &PathBuf, args: &[OsString]) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        let is_shim = executable
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"));
+        if is_shim {
+            let mut command = Command::new("cmd.exe");
+            command.arg("/C").arg(executable).args(args);
+            return command;
+        }
+    }
+    let mut command = Command::new(executable);
+    command.args(args);
+    command
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenClawCli {
     executable: PathBuf,
@@ -65,6 +85,27 @@ impl OpenClawCli {
             return Ok(Self::new(managed, home));
         }
 
+        // Windows installs the CLI wrapper at `%USERPROFILE%\.local\bin\openclaw.cmd`
+        // (the native installer's git/local prefix) or, for the bundled-package
+        // install, at the npm global prefix (`%APPDATA%\npm\openclaw.cmd` by
+        // default). A freshly installed user PATH is not visible to this process,
+        // so probe those fixed locations explicitly.
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(profile) = env::var_os("USERPROFILE") {
+                let wrapper = PathBuf::from(profile).join(".local\\bin\\openclaw.cmd");
+                if wrapper.is_file() {
+                    return Ok(Self::new(wrapper, home));
+                }
+            }
+            if let Some(appdata) = env::var_os("APPDATA") {
+                let npm_shim = PathBuf::from(appdata).join("npm\\openclaw.cmd");
+                if npm_shim.is_file() {
+                    return Ok(Self::new(npm_shim, home));
+                }
+            }
+        }
+
         Ok(Self::new(PathBuf::from("openclaw"), home))
     }
 
@@ -114,8 +155,11 @@ impl OpenClawCli {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let mut command = Command::new(&self.executable);
-        command.args(args);
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect();
+        let mut command = build_command(&self.executable, &args);
         command.env("PATH", self.command_path()?);
         command.stdin(Stdio::null());
         Ok(command)

@@ -2,28 +2,27 @@
 use crate::cli::openclaw_home;
 use crate::cli::{OpenClawCli, SpawnCommand};
 use serde::Deserialize;
-#[cfg(not(target_os = "windows"))]
 use serde::Serialize;
-#[cfg(not(target_os = "windows"))]
 use std::collections::VecDeque;
-#[cfg(not(target_os = "windows"))]
 use std::io::{BufRead, BufReader};
-#[cfg(not(target_os = "windows"))]
 use std::process::{Command, Stdio};
-#[cfg(not(target_os = "windows"))]
 use std::sync::mpsc;
-#[cfg(not(target_os = "windows"))]
 use std::thread;
-#[cfg(not(target_os = "windows"))]
 use tauri::path::BaseDirectory;
 use tauri::AppHandle;
-#[cfg(not(target_os = "windows"))]
 use tauri::{Emitter, Manager};
 
-#[cfg(not(target_os = "windows"))]
 const INSTALL_EVENT: &str = "install-progress";
-#[cfg(not(target_os = "windows"))]
 const ERROR_TAIL_LINES: usize = 24;
+
+/// Repository the Windows installer checks out, so the installed agent is this
+/// fork rather than the upstream npm package. Overridable for mirrors/testing.
+#[cfg(target_os = "windows")]
+fn fork_git_url() -> String {
+    std::env::var("OPENCLAW_FORK_GIT_URL").unwrap_or_else(|_| {
+        "https://github.com/wasimmostakim2965-ui/Open-Wai.git".to_string()
+    })
+}
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,7 +43,6 @@ impl InstallChannel {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InstallProgress<'a> {
@@ -52,19 +50,67 @@ struct InstallProgress<'a> {
     line: &'a str,
 }
 
+/// Windows install path. Prefer a bundled agent package (offline, single-shot);
+/// fall back to a source checkout of this fork when no package ships with the
+/// installer. Either way the installed agent is THIS fork, not upstream.
 #[cfg(target_os = "windows")]
-pub fn install(_app: &AppHandle, _channel: InstallChannel) -> Result<(), String> {
-    Err("CLI installation is unavailable in this Windows test build.".to_string())
+pub fn install(app: &AppHandle, _channel: InstallChannel) -> Result<(), String> {
+    if let Some(package) = bundled_agent_package(app) {
+        return install_from_package(app, &package);
+    }
+    install_from_git(app)
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Path to an agent `.tgz` bundled as a resource, when the installer shipped
+/// one. Absence is not an error: we then install from git.
+#[cfg(target_os = "windows")]
+fn bundled_agent_package(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let path = app.path().resolve("openclaw.tgz", BaseDirectory::Resource).ok()?;
+    path.is_file().then_some(path)
+}
+
+#[cfg(target_os = "windows")]
+fn install_from_package(app: &AppHandle, package: &std::path::Path) -> Result<(), String> {
+    let mut command = windows_installer_command(app)?;
+    command
+        .args(["-NoOnboard"])
+        .arg("-Tag")
+        .arg(package);
+    run_installer(app, command, false, None)
+}
+
+#[cfg(target_os = "windows")]
+fn install_from_git(app: &AppHandle) -> Result<(), String> {
+    let mut command = windows_installer_command(app)?;
+    command
+        .args(["-NoOnboard", "-InstallMethod", "git", "-Tag", "main"])
+        .env("OPENCLAW_GIT_REPO_URL", fork_git_url());
+    run_installer(app, command, false, None)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_installer_command(app: &AppHandle) -> Result<Command, String> {
+    let script = app
+        .path()
+        .resolve("install.ps1", BaseDirectory::Resource)
+        .map_err(|error| format!("Bundled installer is unavailable: {error}"))?;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(script);
+    Ok(command)
+}
+
 fn configure_installer_environment(command: &mut Command) {
     // The AppImage runtime exports its bundled usr/lib (Ubuntu 22.04, OpenSSL 3.0)
     // through LD_LIBRARY_PATH. The bundled installer drives host tools (curl, wget,
     // tar, git, and the downloaded Node), so they must resolve against host
     // libraries. Otherwise a newer host libcurl loads the older bundled libssl and
-    // aborts with "OPENSSL_3.2.0 not found" (issue #146088).
+    // aborts with "OPENSSL_3.2.0 not found" (issue #146088). No-op on Windows.
+    #[cfg(not(target_os = "windows"))]
     command.env_remove("LD_LIBRARY_PATH");
+    #[cfg(target_os = "windows")]
+    let _ = command;
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -80,7 +126,7 @@ pub(crate) fn browser_runtime(
     _is_current: &dyn Fn() -> bool,
     _spawn: &SpawnCommand<'_>,
 ) -> Result<OpenClawCli, String> {
-    Err("Browser runtime installation is unavailable in this Windows test build.".into())
+    Err("Preparing the browser runtime is not supported on Windows.".into())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -174,6 +220,19 @@ fn install_at(
             .args(["--install-method", "git", "--git-dir"])
             .arg(prefix.join("dev/openclaw"));
     }
+    run_installer(app, command, runtime_only, spawn)
+}
+
+/// Spawn an installer command, stream its stdout/stderr to the UI as
+/// `install-progress` events, and return a diagnostic error on failure. Shared
+/// by the Windows package/git install paths and the shell installer path.
+fn run_installer(
+    app: &AppHandle,
+    mut command: Command,
+    runtime_only: bool,
+    spawn: Option<&SpawnCommand<'_>>,
+) -> Result<(), String> {
+    configure_installer_environment(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -183,7 +242,7 @@ fn install_at(
         Some(spawn) => spawn(&mut command),
         None => command.spawn().map_err(|error| error.to_string()),
     }
-    .map_err(|error| format!("Could not start bundled installer: {error}"))?;
+    .map_err(|error| format!("Could not start the bundled installer: {error}"))?;
     let stdout = child
         .stdout
         .take()
@@ -223,13 +282,12 @@ fn install_at(
 
     let status = child
         .wait()
-        .map_err(|error| format!("Could not wait for bundled installer: {error}"))?;
+        .map_err(|error| format!("Could not wait for the bundled installer: {error}"))?;
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     if status.success() {
         return Ok(());
     }
-
     let detail = tail.into_iter().collect::<Vec<_>>().join("\n");
     if detail.is_empty() {
         Err(format!("Installer exited with {status}"))
@@ -238,7 +296,6 @@ fn install_at(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn stream_lines<R>(
     stream: &'static str,
     reader: R,
