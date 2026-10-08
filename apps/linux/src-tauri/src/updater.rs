@@ -14,11 +14,11 @@ pub(crate) const PROGRESS_EVENT: &str = "updater://progress";
 pub(crate) const READY_EVENT: &str = "updater://ready";
 pub(crate) const ERROR_EVENT: &str = "updater://error";
 
-const RELEASE_URL: &str = "https://github.com/openclaw/openclaw/releases/latest";
+const RELEASE_URL: &str = "https://github.com/wasimmostakim2965-ui/Open-Wai/releases/latest";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 // Test desktop builds need a channel that Linux-only releases never replace.
 const DESKTOP_TEST_UPDATE_ENDPOINT: &str =
-    "https://github.com/openclaw/openclaw/releases/download/desktop-test/latest-desktop-test.json";
+    "https://github.com/wasimmostakim2965-ui/Open-Wai/releases/download/desktop-test/latest-desktop-test.json";
 const AUTO_CHECK_DELAY: Duration = Duration::from_secs(3);
 
 #[cfg(any(target_os = "linux", test))]
