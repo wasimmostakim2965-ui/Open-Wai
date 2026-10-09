@@ -344,7 +344,10 @@ async function normalizeWorkspaceProtocol(tarball, workDir) {
   const stage = join(workDir, "wsfix");
   await rm(stage, { recursive: true, force: true });
   await mkdir(stage, { recursive: true });
-  run("tar", ["xzf", tarball, "-C", stage]);
+  // GNU tar (Git Bash on Windows) parses `D:\...` as a remote host; forward
+  // slashes are the portable form both it and Linux tar accept.
+  const asTarPath = (p) => (process.platform === "win32" ? p.replace(/\\/g, "/") : p);
+  run("tar", ["xzf", asTarPath(tarball), "-C", asTarPath(stage)]);
   const manifestPath = join(stage, "package", "package.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   const version = manifest.version;
@@ -365,7 +368,7 @@ async function normalizeWorkspaceProtocol(tarball, workDir) {
   }
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   const normalized = join(workDir, "openclaw-normalized.tgz");
-  run("tar", ["czf", normalized, "-C", stage, "package"]);
+  run("tar", ["czf", asTarPath(normalized), "-C", asTarPath(stage), "package"]);
   console.log(`[runtime] Rewrote workspace: deps to ${version}: ${rewritten.join(", ")}`);
   return normalized;
 }
