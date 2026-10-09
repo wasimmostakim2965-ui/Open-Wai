@@ -228,8 +228,13 @@ jobs:
           Copy-Item -LiteralPath $installer.FullName -Destination $destination
           Write-Host ("staged {0} ({1:N0} bytes)" -f $destination, $installer.Length)
 
-          # Prove the offline runtime shipped: the resource must exist, be a zip,
-          # and the installer must be large enough to contain it.
+          # Prove the offline runtime shipped: the resource must exist and be a zip.
+          # The installer embeds it NSIS/LZMA-compressed, so the installer is NOT
+          # guaranteed to be larger than the raw runtime zip (the runtime is itself
+          # deflated, so recompressing it shrinks it further). Do not assert a size
+          # relationship — NSIS compression makes it invalid. Assert instead that
+          # the installer is a plausible self-contained payload and report both
+          # sizes so a regression is visible.
           $runtime = "apps/linux/src-tauri/target/installers/openclaw-runtime.zip"
           if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) {
             throw "The self-contained runtime archive was not staged for bundling."
@@ -238,8 +243,11 @@ jobs:
           if ($runtimeBytes.Length -lt 4 -or $runtimeBytes[0] -ne 0x50 -or $runtimeBytes[1] -ne 0x4B) {
             throw "The self-contained runtime archive is not a zip file."
           }
-          if ($installer.Length -le $runtimeBytes.Length) {
-            throw "The installer ($($installer.Length) bytes) does not contain the runtime archive ($($runtimeBytes.Length) bytes)."
+          if ($runtimeBytes.Length -lt 50MB) {
+            throw "The self-contained runtime archive is only $($runtimeBytes.Length) bytes; the bundled dependency tree did not ship."
+          }
+          if ($installer.Length -lt 50MB) {
+            throw "The installer ($($installer.Length) bytes) is too small to embed the runtime; the resource was not bundled."
           }
           Write-Host ("bundled offline runtime: {0:N0} bytes (installer {1:N0} bytes)" -f $runtimeBytes.Length, $installer.Length)
 
