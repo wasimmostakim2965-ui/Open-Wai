@@ -27,7 +27,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
@@ -59,6 +59,29 @@ function parseArgs(argv) {
 
 function run(command, commandArgs, options = {}) {
   execFileSync(command, commandArgs, { stdio: "inherit", ...options });
+}
+
+// Resolve a way to run npm that works on every platform. Node 24 refuses to
+// spawn `.cmd` shims without a shell, so prefer invoking npm's JS entry point
+// with the current Node binary and fall back to a shell only if that is absent.
+function runNpm(args, options = {}) {
+  const nodeDir = dirname(process.execPath);
+  const npmCliCandidates =
+    process.platform === "win32"
+      ? [join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js")]
+      : [
+          join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+          join(nodeDir, "..", "libexec", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+        ];
+  const npmCli = npmCliCandidates.find((candidate) => existsSync(candidate));
+  if (npmCli) {
+    run(process.execPath, [npmCli, ...args], options);
+    return;
+  }
+  run(process.platform === "win32" ? "npm.cmd" : "npm", args, {
+    ...options,
+    shell: process.platform === "win32",
+  });
 }
 
 function parseVersion(version) {
@@ -313,8 +336,7 @@ async function main() {
   console.log("[runtime] Installing the agent and its production dependencies");
   // A global install into an explicit prefix yields the self-relative
   // `openclaw.cmd` shim next to `node.exe`, matching what the shell probes for.
-  run(
-    "npm",
+  runNpm(
     [
       "install",
       "--global",
