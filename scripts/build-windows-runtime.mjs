@@ -334,6 +334,42 @@ function resolveGlobalLayout(prefix) {
   };
 }
 
+// The repo uses pnpm, so its `package.json` declares internal packages with the
+// pnpm-only `workspace:*` protocol (for example `@openclaw/ai`). `npm pack`
+// leaves those untouched and npm cannot resolve `workspace:*`, so the tarball
+// installs nowhere. Rewrite every `workspace:` range to the pack version (all
+// internal packages release in lockstep) and re-tar. This mirrors what `pnpm
+// pack` does automatically.
+async function normalizeWorkspaceProtocol(tarball, workDir) {
+  const stage = join(workDir, "wsfix");
+  await rm(stage, { recursive: true, force: true });
+  await mkdir(stage, { recursive: true });
+  run("tar", ["xzf", tarball, "-C", stage]);
+  const manifestPath = join(stage, "package", "package.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const version = manifest.version;
+  const rewritten = [];
+  for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    const ranges = manifest[field];
+    if (!ranges) continue;
+    for (const [name, range] of Object.entries(ranges)) {
+      if (typeof range === "string" && range.startsWith("workspace:")) {
+        ranges[name] = version;
+        rewritten.push(name);
+      }
+    }
+  }
+  if (rewritten.length === 0) {
+    console.log("[runtime] No workspace: ranges to rewrite.");
+    return tarball;
+  }
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const normalized = join(workDir, "openclaw-normalized.tgz");
+  run("tar", ["czf", normalized, "-C", stage, "package"]);
+  console.log(`[runtime] Rewrote workspace: deps to ${version}: ${rewritten.join(", ")}`);
+  return normalized;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -347,6 +383,7 @@ async function main() {
     throw new Error(`Packaged agent tarball not found: ${packageTarball}`);
   }
   await mkdir(workDir, { recursive: true });
+  const installTarball = await normalizeWorkspaceProtocol(packageTarball, workDir);
   const runtimeDir = join(workDir, "runtime");
   await rm(runtimeDir, { recursive: true, force: true });
   await mkdir(runtimeDir, { recursive: true });
@@ -384,7 +421,7 @@ async function main() {
       "--global",
       "--prefix",
       runtimeDir,
-      packageTarball,
+      installTarball,
       // The repo `.npmrc` pins a 7-day release cooldown; the bundled runtime must
       // match the dependency set this package was packed against.
       "--min-release-age=0",
