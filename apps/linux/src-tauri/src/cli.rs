@@ -320,10 +320,27 @@ impl OpenClawCli {
     }
 
     fn command_path(&self) -> Result<OsString, CliError> {
-        let mut paths = vec![
-            self.openclaw_home.join("bin"),
-            self.openclaw_home.join("tools/node/bin"),
-        ];
+        let mut paths: Vec<PathBuf> = Vec::new();
+        // The CLI shim's own directory holds the Node runtime that runs it (the
+        // bundled self-contained install), so it must precede everything else.
+        // A bare `openclaw` fallback has an empty parent; never add that entry.
+        if let Some(parent) = self.executable.parent() {
+            if !parent.as_os_str().is_empty() {
+                paths.push(parent.to_path_buf());
+            }
+        }
+        paths.push(self.openclaw_home.join("bin"));
+        paths.push(self.openclaw_home.join("tools/node/bin"));
+        // The bundled installer's runtime uses a versioned `tools/node-<version>`
+        // prefix rather than the `tools/node` alias; expose it so child Node
+        // processes resolve too.
+        if let Ok(entries) = std::fs::read_dir(self.openclaw_home.join("tools")) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("node") {
+                    paths.push(entry.path());
+                }
+            }
+        }
         if let Some(current) = env::var_os("PATH") {
             paths.extend(env::split_paths(&current));
         }

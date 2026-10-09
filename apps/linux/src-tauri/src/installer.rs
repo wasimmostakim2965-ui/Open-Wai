@@ -50,15 +50,41 @@ struct InstallProgress<'a> {
     line: &'a str,
 }
 
-/// Windows install path. Prefer a bundled agent package (offline, single-shot);
-/// fall back to a source checkout of this fork when no package ships with the
-/// installer. Either way the installed agent is THIS fork, not upstream.
+/// Windows install path. Prefer a bundled, self-contained runtime archive
+/// (portable Node.js + agent + dependencies, offline and single-shot); fall back
+/// to a bundled agent package (dependencies fetched from npm), then to a source
+/// checkout of this fork. Either way the installed agent is THIS fork.
 #[cfg(target_os = "windows")]
 pub fn install(app: &AppHandle, _channel: InstallChannel) -> Result<(), String> {
+    if let Some(runtime) = bundled_runtime_archive(app) {
+        return install_from_runtime(app, &runtime);
+    }
     if let Some(package) = bundled_agent_package(app) {
         return install_from_package(app, &package);
     }
     install_from_git(app)
+}
+
+/// Path to a self-contained runtime `.zip` bundled as a resource, when the
+/// installer shipped one. Its presence means a first run needs no npm, git, or
+/// network access.
+#[cfg(target_os = "windows")]
+fn bundled_runtime_archive(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let path = app
+        .path()
+        .resolve("openclaw-runtime.zip", BaseDirectory::Resource)
+        .ok()?;
+    path.is_file().then_some(path)
+}
+
+#[cfg(target_os = "windows")]
+fn install_from_runtime(app: &AppHandle, runtime: &std::path::Path) -> Result<(), String> {
+    let mut command = windows_installer_command(app)?;
+    command
+        .args(["-NoOnboard"])
+        .arg("-RuntimeArchive")
+        .arg(runtime);
+    run_installer(app, command, false, None)
 }
 
 /// Path to an agent `.tgz` bundled as a resource, when the installer shipped

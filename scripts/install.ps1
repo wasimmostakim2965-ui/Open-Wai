@@ -15,6 +15,7 @@ param(
     [string]$NodePrefix,
     [ValidatePattern("^\d+\.\d+\.\d+$")]
     [string]$NodeVersion,
+    [string]$RuntimeArchive,
     [switch]$Help
 )
 
@@ -41,6 +42,8 @@ Options:
   -NodeOnly               Install only a private Node.js runtime; do not change PATH
   -NodePrefix <path>      Absolute private directory for -NodeOnly (required)
   -NodeVersion <version>  Exact private Node.js version for -NodeOnly
+  -RuntimeArchive <path>  Extract a prebuilt self-contained runtime (Node + agent +
+                          dependencies); no npm, git, or network access required
   -Help                   Show this help
 "@ | Write-Output
     return
@@ -629,6 +632,135 @@ function Install-PortableNode {
 
     $nodeVersion = (& node -v 2>$null)
     Write-Host "[OK] User-local Node.js ready: $nodeVersion" -ForegroundColor Green
+}
+
+# Extract a prebuilt, self-contained runtime archive (portable Node.js plus the
+# agent package with its production dependencies) into a managed `tools/node*`
+# prefix. The archive is produced for Windows x64 by scripts/build-windows-runtime.mjs
+# and unpacked verbatim, so a first run needs no npm, no git, and no network.
+function Install-OpenClawRuntimeArchive {
+    param([Parameter(Mandatory = $true)][string]$ArchivePath)
+
+    $archive = [System.IO.Path]::GetFullPath($ArchivePath)
+    if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+        Write-Host "Error: bundled runtime archive not found: $archive" -ForegroundColor Red
+        return $false
+    }
+
+    $userHome = [Environment]::GetFolderPath("UserProfile")
+    if ([string]::IsNullOrWhiteSpace($userHome)) {
+        Write-Host "Error: the user profile directory is unavailable." -ForegroundColor Red
+        return $false
+    }
+    $toolsRoot = Join-Path $userHome ".openclaw\tools"
+    New-Item -ItemType Directory -Force -Path $toolsRoot | Out-Null
+
+    $manifest = $null
+    try {
+        $manifest = Get-ArchiveFileContent -ArchivePath $archive -EntryName "openclaw-runtime.json" | ConvertFrom-Json
+    } catch {
+        Write-Host "Error: the bundled runtime archive is invalid: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+    $nodeVersion = if ($manifest -and $manifest.node) { "$($manifest.node)".TrimStart("v") } else { $null }
+    if ([string]::IsNullOrWhiteSpace($nodeVersion)) {
+        Write-Host "Error: the bundled runtime archive has no Node.js version manifest." -ForegroundColor Red
+        return $false
+    }
+
+    $destination = Join-Path $toolsRoot "node-$nodeVersion"
+    $staging = Join-Path $toolsRoot ("node-staging-" + [guid]::NewGuid().ToString("N"))
+    try {
+        Write-Host "[*] Unpacking the bundled OpenClaw runtime (Node.js $nodeVersion)..." -ForegroundColor Yellow
+        Expand-RuntimeArchive -ArchivePath $archive -DestinationPath $staging
+
+        $nodeExe = Join-Path $staging "node.exe"
+        $shim = Join-Path $staging "openclaw.cmd"
+        if (-not (Test-Path -LiteralPath $nodeExe -PathType Leaf)) {
+            Write-Host "Error: the bundled runtime archive is missing node.exe." -ForegroundColor Red
+            return $false
+        }
+        if (-not (Test-Path -LiteralPath $shim -PathType Leaf)) {
+            Write-Host "Error: the bundled runtime archive is missing the openclaw.cmd shim." -ForegroundColor Red
+            return $false
+        }
+
+        if (Test-Path -LiteralPath $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+        }
+        [System.IO.Directory]::Move($staging, $destination)
+    } catch {
+        Write-Host "Error: unpacking the bundled runtime failed: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    } finally {
+        if (Test-Path -LiteralPath $staging) {
+            Remove-Item -LiteralPath $staging -Recurse -Force
+        }
+    }
+
+    $nodeDir = $destination
+    Add-ToProcessPath $nodeDir
+    if (-not (Check-Node)) {
+        Write-Host "Error: the bundled Node.js runtime is not runnable at $nodeDir." -ForegroundColor Red
+        return $false
+    }
+    if (Add-ToUserPath $nodeDir) {
+        Write-Host "[!] Added $nodeDir to user PATH" -ForegroundColor Yellow
+    }
+
+    $nodeVersionLabel = (& node -v 2>$null)
+    Write-Host "[OK] Bundled OpenClaw runtime ready: $nodeVersionLabel" -ForegroundColor Green
+    return $true
+}
+
+# Read a single text entry from a `.zip` archive without fully extracting it.
+function Get-ArchiveFileContent {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$EntryName
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $entry = $zip.Entries | Where-Object { $_.FullName -ieq $EntryName -or $_.Name -ieq $EntryName } | Select-Object -First 1
+        if (-not $entry) {
+            throw "the archive does not contain $EntryName"
+        }
+        $reader = New-Object System.IO.StreamReader($entry.Open())
+        try {
+            return $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+# Extract a `.zip` archive (either the raw runtime or a wrapper containing one).
+function Expand-RuntimeArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+
+    New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
+
+    $tarCommand = Get-Command tar -ErrorAction SilentlyContinue
+    if ($tarCommand -and $tarCommand.Source) {
+        # Discard tool output so only this function's own result reaches the caller.
+        $null = Invoke-CommandFromWindowsSafeDirectory -CommandPath $tarCommand.Source -Arguments @("-xf", $ArchivePath, "-C", $DestinationPath)
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+        Write-Host "[!] tar extraction failed; trying .NET zip extraction." -ForegroundColor Yellow
+        Remove-Item -Recurse -Force $DestinationPath -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $DestinationPath)
 }
 
 function Invoke-NodePackageManagerInstall {
@@ -2311,6 +2443,54 @@ function Main {
 
     # Check for existing installation
     $isUpgrade = Check-ExistingOpenClaw
+
+    # A bundled prebuilt runtime is fully self-contained: unpack it and skip the
+    # network-dependent Node.js, git, and npm install steps entirely.
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeArchive)) {
+        $runtimeResult = @(Install-OpenClawRuntimeArchive -ArchivePath $RuntimeArchive)
+        if (-not (Test-BooleanSuccessResult -Results $runtimeResult)) {
+            Fail-Install
+            return
+        }
+        if (-not (Ensure-OpenClawOnPath)) {
+            Write-Host "OpenClaw was installed, but its command is not on PATH." -ForegroundColor Yellow
+            Fail-Install
+            return
+        }
+        Refresh-GatewayServiceIfLoaded
+
+        if ($isUpgrade) {
+            $doctorResults = @(Run-Doctor)
+            if (-not (Test-BooleanSuccessResult -Results $doctorResults)) {
+                Fail-Install
+                return
+            }
+        }
+
+        $installedVersion = $null
+        try {
+            $installedVersion = (Invoke-OpenClawCommand --version 2>$null).Trim()
+        } catch {
+            $installedVersion = $null
+        }
+        Write-Host ""
+        if ($installedVersion) {
+            Write-Host "OpenClaw installed successfully ($installedVersion)!" -ForegroundColor Green
+        } else {
+            Write-Host "OpenClaw installed successfully!" -ForegroundColor Green
+        }
+        Write-Host ""
+        if ($NoOnboard) {
+            Write-Host "Skipping onboard (requested). Run " -NoNewline
+            Write-Host "openclaw onboard" -ForegroundColor Cyan -NoNewline
+            Write-Host " later."
+        } else {
+            Write-Host "Starting setup..." -ForegroundColor Cyan
+            Write-Host ""
+            Invoke-InteractiveOpenClawCommand onboard
+        }
+        return $true
+    }
 
     # Step 1: Node.js
     if (-not (Check-Node)) {

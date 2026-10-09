@@ -19,6 +19,9 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/build-windows.yml"
+      - "scripts/install.ps1"
+      - "scripts/install-cli.sh"
+      - "scripts/build-windows-runtime.mjs"
       - "apps/linux/src-tauri/**"
       - "apps/linux/ui/**"
 
@@ -32,7 +35,7 @@ jobs:
   build-windows:
     name: Build Windows installer (.exe)
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,16 +81,40 @@ jobs:
           npm pack --ignore-scripts
           ls -la openclaw-*.tgz
 
-      - name: Stage the bundled agent package
+      - name: Build the self-contained Windows runtime
         shell: bash
         run: |
           set -euo pipefail
-          # The Windows shell installs this fork's agent from the packaged tarball
-          # bundled as the `openclaw.tgz` resource (offline, single-shot). The
-          # `target/installers/*.sh`/`*.ps1` resources are written by build.rs.
-          mkdir -p apps/linux/src-tauri/target/installers
-          cp openclaw-*.tgz apps/linux/src-tauri/target/installers/openclaw.tgz
-          ls -la apps/linux/src-tauri/target/installers/
+          # Portable Node.js + the agent + its production dependencies, packed so a
+          # first run needs no npm, git, or network access. This single archive ships
+          # as the `openclaw-runtime.zip` resource and supersedes the plain agent
+          # tarball, so the installer only carries one self-contained payload.
+          node scripts/build-windows-runtime.mjs \
+            --package "$(ls openclaw-*.tgz)" \
+            --out apps/linux/src-tauri/target/installers/openclaw-runtime.zip
+          ls -la apps/linux/src-tauri/target/installers/openclaw-runtime.zip
+
+      - name: Validate the bundled installer script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Parse the PowerShell installer so a syntax error can never ship, and
+          # prove the new offline `-RuntimeArchive` option binds.
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "scripts/install.ps1").Path,
+            [ref]$null,
+            [ref]$parseErrors
+          )
+          if ($parseErrors) {
+            $parseErrors | ForEach-Object { Write-Error $_.ToString() }
+            throw "scripts/install.ps1 has parse errors."
+          }
+          $help = & scripts/install.ps1 -Help
+          if (-not ($help -match "RuntimeArchive")) {
+            throw "scripts/install.ps1 does not expose -RuntimeArchive."
+          }
+          Write-Host "install.ps1 parses and exposes -RuntimeArchive."
 
       - name: Stamp the release version
         shell: bash
@@ -133,7 +160,7 @@ jobs:
           # not list even though `icons/icon.ico` ships in the repo.
           # `createUpdaterArtifacts:false` keeps this build keyless.
           pnpm dlx @tauri-apps/cli@2.11.4 build --bundles nsis \
-            --config "{\"identifier\":\"ai.openclaw.windows\",\"bundle\":{\"createUpdaterArtifacts\":false,\"resources\":{\"target/installers/install-cli.sh\":\"install-cli.sh\",\"target/installers/install.ps1\":\"install.ps1\",\"target/installers/openclaw.tgz\":\"openclaw.tgz\"},\"icon\":[\"icons/32x32.png\",\"icons/128x128.png\",\"icons/128x128@2x.png\",\"icons/icon.png\",\"icons/icon.ico\"]}}"
+            --config "{\"identifier\":\"ai.openclaw.windows\",\"bundle\":{\"createUpdaterArtifacts\":false,\"resources\":{\"target/installers/install-cli.sh\":\"install-cli.sh\",\"target/installers/install.ps1\":\"install.ps1\",\"target/installers/openclaw-runtime.zip\":\"openclaw-runtime.zip\"},\"icon\":[\"icons/32x32.png\",\"icons/128x128.png\",\"icons/128x128@2x.png\",\"icons/icon.png\",\"icons/icon.ico\"]}}"
 
       - name: Verify and stage installer
         shell: pwsh
@@ -153,6 +180,21 @@ jobs:
           $destination = "dist/windows-app/OpenClaw-windows-x64-setup.exe"
           Copy-Item -LiteralPath $installer.FullName -Destination $destination
           Write-Host ("staged {0} ({1:N0} bytes)" -f $destination, $installer.Length)
+
+          # Prove the offline runtime shipped: the resource must exist, be a zip,
+          # and the installer must be large enough to contain it.
+          $runtime = "apps/linux/src-tauri/target/installers/openclaw-runtime.zip"
+          if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) {
+            throw "The self-contained runtime archive was not staged for bundling."
+          }
+          $runtimeBytes = [System.IO.File]::ReadAllBytes($runtime)
+          if ($runtimeBytes.Length -lt 4 -or $runtimeBytes[0] -ne 0x50 -or $runtimeBytes[1] -ne 0x4B) {
+            throw "The self-contained runtime archive is not a zip file."
+          }
+          if ($installer.Length -le $runtimeBytes.Length) {
+            throw "The installer ($($installer.Length) bytes) does not contain the runtime archive ($($runtimeBytes.Length) bytes)."
+          }
+          Write-Host ("bundled offline runtime: {0:N0} bytes (installer {1:N0} bytes)" -f $runtimeBytes.Length, $installer.Length)
 
       - name: Upload installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
