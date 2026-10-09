@@ -61,6 +61,16 @@ function run(command, commandArgs, options = {}) {
   execFileSync(command, commandArgs, { stdio: "inherit", ...options });
 }
 
+// Streams a large payload through a child without putting it on the command
+// line. GNU tar on Windows treats any `X:` path argument as a remote host
+// ("Cannot connect to D"), so tar is always driven by cwd + stdio, never args.
+function runCapture(command, commandArgs, options = {}) {
+  return execFileSync(command, commandArgs, {
+    maxBuffer: 4 * 1024 * 1024 * 1024,
+    ...options,
+  });
+}
+
 // Resolve a way to run npm that works on every platform. Node 24 refuses to
 // spawn `.cmd` shims without a shell, so prefer invoking npm's JS entry point
 // with the current Node binary and fall back to a shell only if that is absent.
@@ -344,10 +354,12 @@ async function normalizeWorkspaceProtocol(tarball, workDir) {
   const stage = join(workDir, "wsfix");
   await rm(stage, { recursive: true, force: true });
   await mkdir(stage, { recursive: true });
-  // GNU tar (Git Bash on Windows) parses `D:\...` as a remote host; forward
-  // slashes are the portable form both it and Linux tar accept.
-  const asTarPath = (p) => (process.platform === "win32" ? p.replace(/\\/g, "/") : p);
-  run("tar", ["xzf", asTarPath(tarball), "-C", asTarPath(stage)]);
+  // GNU tar on Windows treats any `X:` path argument as a remote host, so drive
+  // tar by cwd + stdio (no path arguments and no `-f`).
+  runCapture("tar", ["xzf", "-"], {
+    cwd: stage,
+    input: await readFile(tarball),
+  });
   const manifestPath = join(stage, "package", "package.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   const version = manifest.version;
@@ -368,7 +380,8 @@ async function normalizeWorkspaceProtocol(tarball, workDir) {
   }
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   const normalized = join(workDir, "openclaw-normalized.tgz");
-  run("tar", ["czf", asTarPath(normalized), "-C", asTarPath(stage), "package"]);
+  const archive = runCapture("tar", ["czf", "-", "package"], { cwd: stage });
+  await writeFile(normalized, archive);
   console.log(`[runtime] Rewrote workspace: deps to ${version}: ${rewritten.join(", ")}`);
   return normalized;
 }
