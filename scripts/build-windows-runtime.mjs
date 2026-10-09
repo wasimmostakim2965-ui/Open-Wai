@@ -16,7 +16,7 @@
 //
 // Zip reading and writing are implemented here with `node:zlib` so the builder
 // runs identically on Linux and Windows runners (GNU tar cannot read zip).
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   cp,
   mkdtemp,
@@ -64,7 +64,7 @@ function run(command, commandArgs, options = {}) {
 // Resolve a way to run npm that works on every platform. Node 24 refuses to
 // spawn `.cmd` shims without a shell, so prefer invoking npm's JS entry point
 // with the current Node binary and fall back to a shell only if that is absent.
-function runNpm(args, options = {}) {
+function npmCommand(args) {
   const nodeDir = dirname(process.execPath);
   const npmCliCandidates =
     process.platform === "win32"
@@ -75,14 +75,42 @@ function runNpm(args, options = {}) {
         ];
   const npmCli = npmCliCandidates.find((candidate) => existsSync(candidate));
   if (npmCli) {
-    run(process.execPath, [npmCli, ...args], options);
-    return;
+    return { command: process.execPath, args: [npmCli, ...args], shell: false };
   }
-  run(process.platform === "win32" ? "npm.cmd" : "npm", args, {
-    ...options,
+  return {
+    command: process.platform === "win32" ? "npm.cmd" : "npm",
+    args,
     shell: process.platform === "win32",
-  });
+  };
 }
+
+async function runNpm(args, options = {}) {
+  const { command, args: commandArgs, shell } = npmCommand(args);
+  const result = spawnSync(command, commandArgs, {
+    stdio: ["ignore", "inherit", "pipe"],
+    shell,
+    encoding: "utf8",
+    ...options,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    if (result.stderr) process.stderr.write(result.stderr);
+    // npm hides the real cause from stderr at low log levels; surface its own
+    // debug log so a CI failure is diagnosable without re-running the build.
+    const cacheDir = options.env?.npm_config_cache;
+    if (cacheDir) {
+      const logDir = join(cacheDir, "_logs");
+      const logs = await readdir(logDir).catch(() => []);
+      const newest = logs.sort().at(-1);
+      if (newest) {
+        const text = await readFile(join(logDir, newest), "utf8").catch(() => "");
+        if (text) process.stderr.write(`\n--- npm debug log (${newest}) ---\n${text}\n`);
+      }
+    }
+    throw new Error(`npm ${args[0] ?? ""} failed with exit code ${result.status}`);
+  }
+}
+
 
 function parseVersion(version) {
   return version.replace(/^v/, "").split(".").map((part) => Number.parseInt(part, 10));
@@ -336,7 +364,9 @@ async function main() {
   console.log("[runtime] Installing the agent and its production dependencies");
   // A global install into an explicit prefix yields the self-relative
   // `openclaw.cmd` shim next to `node.exe`, matching what the shell probes for.
-  runNpm(
+  const npmCache = join(workDir, "npm-cache");
+  await mkdir(npmCache, { recursive: true });
+  await runNpm(
     [
       "install",
       "--global",
@@ -350,7 +380,7 @@ async function main() {
       "--no-fund",
       "--loglevel=error",
     ],
-    { cwd: workDir },
+    { cwd: workDir, env: { ...process.env, npm_config_cache: npmCache } },
   );
   await stat(shim).catch(() => {
     throw new Error(`The runtime is missing the CLI shim (${shim}).`);

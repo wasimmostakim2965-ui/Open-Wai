@@ -32,8 +32,56 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # The agent build is by far the slowest step (~35-40 min on windows-latest), and
+  # it does not change while iterating on the desktop shell or the runtime
+  # builder. Build the tarball once here and hand it to `build` as an artifact, so
+  # re-running `build` alone is a few minutes instead of a full rebuild.
+  package:
+    name: Build the agent package
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile --prefer-offline \
+            --config.ignore-scripts=false --config.engine-strict=false \
+            --config.enable-pre-post-scripts=true --config.side-effects-cache=true
+
+      - name: Build the agent package (this fork)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm build
+          npm pack --ignore-scripts
+          ls -la openclaw-*.tgz
+
+      - name: Upload the agent package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openclaw-agent-package
+          path: openclaw-*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
   build-windows:
     name: Build Windows installer (.exe)
+    needs: package
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -64,22 +112,10 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          corepack enable
-          pnpm install --frozen-lockfile --prefer-offline \
-            --config.ignore-scripts=false --config.engine-strict=false \
-            --config.enable-pre-post-scripts=true --config.side-effects-cache=true
-
-      - name: Build the agent package (this fork)
-        shell: bash
-        run: |
-          set -euo pipefail
-          pnpm build
-          npm pack --ignore-scripts
-          ls -la openclaw-*.tgz
+      - name: Download the agent package
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: openclaw-agent-package
 
       - name: Build the self-contained Windows runtime
         shell: bash
@@ -93,6 +129,7 @@ jobs:
             --package "$(ls openclaw-*.tgz)" \
             --out apps/linux/src-tauri/target/installers/openclaw-runtime.zip
           ls -la apps/linux/src-tauri/target/installers/openclaw-runtime.zip
+
 
       - name: Validate the bundled installer script
         shell: pwsh
