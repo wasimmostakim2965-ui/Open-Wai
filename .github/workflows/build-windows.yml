@@ -112,6 +112,16 @@ jobs:
         with:
           node-version: 24
 
+      - name: Enable pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `Build Windows installer` runs `pnpm dlx @tauri-apps/cli`, but this job
+          # does not run `pnpm install`, so nothing else provides pnpm. Activate
+          # the pinned packageManager (pnpm@12.5.1) via corepack.
+          corepack enable
+          pnpm --version
+
       - name: Download the agent package
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
