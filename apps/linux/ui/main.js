@@ -70,6 +70,7 @@ let remoteTransport = "direct";
 let remoteConnectionPending = false;
 let editingConnection = false;
 let activeRemoteRetry = null;
+let autoSetupPending = false;
 
 function show(element, visible) {
   element.classList.toggle("hidden", !visible);
@@ -100,7 +101,10 @@ function render({
   show(elements.editConnection, false);
   show(elements.welcomeScreen, false);
   show(elements.connectionChoices, false);
-  show(elements.discovery, true);
+  // Each render states the whole connection surface. `renderConnectionChoices`
+  // turns discovery back on for the remote picker; a plain render only shows the
+  // spinner/progress states and must not leave the network scan visible.
+  show(elements.discovery, false);
 }
 
 function renderAction(options, action) {
@@ -297,13 +301,56 @@ async function connect() {
       firstRunBuild = await invoke("build_info").catch(() => null);
       if (firstRunBuild?.releaseBuild === false) {
         elements.channel.value = "dev";
+        // A development build cannot auto-install itself: it has no stamped
+        // release version and its bundled package is a branch snapshot. Keep the
+        // existing first-run wizard for those builds (the CI development smoke
+        // relies on it).
+        renderWelcome();
+      } else {
+        // A stamped release build (the shipped installer) goes straight to chat:
+        // no welcome, no "on this computer / on another computer" question, no
+        // release-channel picker. It installs and starts the local Gateway
+        // silently and opens the dashboard.
+        void beginAutoSetup();
       }
-      renderWelcome();
     } else if (snapshot.phase === "remoteError") {
       renderRemoteRetry(snapshot.detail);
     }
   } catch (error) {
     renderRetry(friendlyError(error));
+  }
+}
+
+// A release build with no local Gateway installs and starts one without asking.
+// The window stays on the progress view through install, repair, and connect, and
+// only becomes a retryable error if a step fails. There is no wizard step to leave.
+async function beginAutoSetup() {
+  if (autoSetupPending) {
+    return;
+  }
+  autoSetupPending = true;
+  const installFirst = firstRunPhase === "missingCli";
+  render({
+    activity: installFirst ? "Setting up OpenClaw…" : "Starting your Gateway…",
+    description: installFirst
+      ? "OpenClaw is installing the assistant and preparing your chat on this computer."
+      : "OpenClaw is preparing your assistant on this computer.",
+    eyebrow: "SETUP",
+    title: "Setting up your assistant",
+  });
+  try {
+    if (installFirst) {
+      const snapshot = await invoke("install_cli", { channel: "stable" });
+      if (snapshot?.phase === "remoteError") {
+        renderRemoteRetry(snapshot.detail);
+      }
+      return;
+    }
+    await invoke("bootstrap", { explicitLocal: true });
+  } catch (error) {
+    renderRetry(friendlyError(error));
+  } finally {
+    autoSetupPending = false;
   }
 }
 

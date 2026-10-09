@@ -20,6 +20,7 @@ on:
     paths:
       - ".github/workflows/build-windows.yml"
       - "apps/linux/src-tauri/**"
+      - "apps/linux/ui/**"
 
 permissions:
   contents: write
