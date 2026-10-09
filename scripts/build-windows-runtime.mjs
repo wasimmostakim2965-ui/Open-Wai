@@ -86,29 +86,41 @@ function npmCommand(args) {
 
 async function runNpm(args, options = {}) {
   const { command, args: commandArgs, shell } = npmCommand(args);
-  const result = spawnSync(command, commandArgs, {
-    stdio: ["ignore", "inherit", "pipe"],
-    shell,
-    encoding: "utf8",
-    ...options,
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    if (result.stderr) process.stderr.write(result.stderr);
-    // npm hides the real cause from stderr at low log levels; surface its own
-    // debug log so a CI failure is diagnosable without re-running the build.
-    const cacheDir = options.env?.npm_config_cache;
-    if (cacheDir) {
-      const logDir = join(cacheDir, "_logs");
-      const logs = await readdir(logDir).catch(() => []);
-      const newest = logs.sort().at(-1);
-      if (newest) {
-        const text = await readFile(join(logDir, newest), "utf8").catch(() => "");
-        if (text) process.stderr.write(`\n--- npm debug log (${newest}) ---\n${text}\n`);
-      }
+  const attempts = 3;
+  let lastStderr = "";
+  let lastExit = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = spawnSync(command, commandArgs, {
+      stdio: ["ignore", "inherit", "pipe"],
+      shell,
+      encoding: "utf8",
+      ...options,
+    });
+    if (result.error) throw result.error;
+    if (result.status === 0) return;
+    lastExit = result.status;
+    lastStderr = result.stderr ?? "";
+    if (attempt < attempts) {
+      // Registry hiccups (ETIMEDOUT/ECONNRESET/ETARGET) are transient; a retry
+      // keeps a flaky network from failing the whole installer build.
+      console.warn(`[runtime] npm ${args[0] ?? ""} failed (exit ${result.status}); retrying (${attempt}/${attempts - 1})...`);
+      await new Promise((resolve) => setTimeout(resolve, 5000 * attempt));
     }
-    throw new Error(`npm ${args[0] ?? ""} failed with exit code ${result.status}`);
   }
+  if (lastStderr) process.stderr.write(lastStderr);
+  // npm hides the real cause from stderr at low log levels; surface its own
+  // debug log so a CI failure is diagnosable without re-running the build.
+  const cacheDir = options.env?.npm_config_cache;
+  if (cacheDir) {
+    const logDir = join(cacheDir, "_logs");
+    const logs = await readdir(logDir).catch(() => []);
+    const newest = logs.sort().at(-1);
+    if (newest) {
+      const text = await readFile(join(logDir, newest), "utf8").catch(() => "");
+      if (text) process.stderr.write(`\n--- npm debug log (${newest}) ---\n${text}\n`);
+    }
+  }
+  throw new Error(`npm ${args[0] ?? ""} failed with exit code ${lastExit}`);
 }
 
 
@@ -390,17 +402,23 @@ async function main() {
       throw new Error("The runtime is missing the installed agent package.");
     }),
   );
-  const installedDeps = (await readdir(nodeModules, { withFileTypes: true })).filter(
-    (entry) => entry.isDirectory() && entry.name !== "openclaw" && entry.name !== ".bin",
-  );
-  if (installedDeps.length < 50) {
-    const message = `The runtime only contains ${installedDeps.length} dependencies; the agent's dependency tree did not install.`;
+  // npm may hoist dependencies to the prefix root or nest them inside the
+  // installed package; count both so the check works for either layout.
+  const countPackageDirs = async (dir) =>
+    (await readdir(dir, { withFileTypes: true }).catch(() => [])).filter(
+      (entry) => entry.isDirectory() && entry.name !== ".bin",
+    ).length;
+  const hoistedDeps = Math.max(0, (await countPackageDirs(nodeModules)) - 1);
+  const nestedDeps = await countPackageDirs(join(openclawDir, "node_modules"));
+  const installedDeps = hoistedDeps + nestedDeps;
+  if (installedDeps < 50) {
+    const message = `The runtime only contains ${installedDeps} dependencies; the agent's dependency tree did not install.`;
     // The shipped build must prove a full dependency tree; a POSIX pipeline
     // exercise may legitimately use a stub package.
     if (windows) throw new Error(message);
     console.warn(`[runtime] WARNING: ${message}`);
   }
-  console.log(`[runtime] Bundled ${installedDeps.length} production dependencies`);
+  console.log(`[runtime] Bundled ${installedDeps} production dependencies`);
 
   console.log("[runtime] Writing the self-contained version manifest");
   await writeFile(
