@@ -96,6 +96,11 @@ jobs:
         shell: bash
         env:
           OPENCLAW_PREPACK_ALLOW_UNRELEASED_CHANGELOG: "1"
+          # The self-contained tarball now vendors the workspace packages and their
+          # transitive deps (thousands of files). Extracting + inventory-checking it
+          # on Windows takes ~5 min, which exceeds the 5 min default and tripped a
+          # spurious timeout. Raise it well clear of the observed runtime.
+          OPENCLAW_DOCKER_PACKAGE_TARBALL_CHECK_TIMEOUT_MS: "900000"
         run: |
           set -euo pipefail
           # Build the fork's own agent package. `npm pack` on the pnpm workspace
