@@ -65,11 +65,27 @@ jobs:
 
       - name: Build the agent package (this fork)
         shell: bash
+        env:
+          OPENCLAW_PREPACK_ALLOW_UNRELEASED_CHANGELOG: "1"
         run: |
           set -euo pipefail
+          # Build the fork's own agent package. `npm pack` on the pnpm workspace
+          # root is unsafe: it rewrites `workspace:*` ranges to an exact version
+          # WITHOUT bundling the in-repo `@openclaw/ai` package, so the runtime
+          # resolves `@openclaw/ai` from the public npm registry. That registry
+          # build does not export `getDefaultAiTransportHost`, which the fork's
+          # own dist code imports, so every extension crashes with an ESM
+          # SyntaxError ("does not provide an export named ...") and the Gateway
+          # never boots (readiness budget exhausted / port 18789 free).
+          # The canonical packer bundles `@openclaw/ai` into the tarball so the
+          # runtime is fully self-contained.
           pnpm build
-          npm pack --ignore-scripts
+          node scripts/package-openclaw-for-docker.mjs \
+            --skip-build --allow-unreleased-changelog \
+            --output-name "openclaw-$(node -p "require('./package.json').version").tgz"
           ls -la openclaw-*.tgz
+          node scripts/check-openclaw-package-tarball.mjs --require-bundled-workspace-deps \
+            "openclaw-$(node -p "require('./package.json').version").tgz"
 
       - name: Upload the agent package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

@@ -686,6 +686,7 @@ function Install-OpenClawRuntimeArchive {
         }
 
         if (Test-Path -LiteralPath $destination) {
+            Stop-RunningGatewayForReplace
             Remove-Item -LiteralPath $destination -Recurse -Force
         }
         [System.IO.Directory]::Move($staging, $destination)
@@ -2257,6 +2258,31 @@ function Test-GatewayServiceLoaded {
         return $false
     }
     return $false
+}
+
+function Stop-RunningGatewayForReplace {
+    # Free the files under ~/.openclaw/tools/node-<version> before replacing them.
+    # A running Gateway schedules its Node process via the "OpenClaw Gateway"
+    # Scheduled Task and keeps node.exe and the bundled node_modules open; a
+    # reinstall cannot remove that directory while the process is alive, which
+    # previously surfaced as "Install Failed" on upgrade. Best-effort: if nothing
+    # is running, or stopping is not permitted, continue and let the move fail
+    # with its own error.
+    try {
+        if (Get-OpenClawCommandPath) {
+            Invoke-OpenClawCommand gateway stop 2>$null | Out-Null
+        }
+    } catch {
+        # A missing or unhealthy CLI is expected on a first install.
+    }
+    if ($env:OS -ne "Windows_NT") {
+        return
+    }
+    try {
+        schtasks.exe /End /TN "OpenClaw Gateway" 2>$null | Out-Null
+    } catch {
+        # The task may not be registered yet.
+    }
 }
 
 function Refresh-GatewayServiceIfLoaded {

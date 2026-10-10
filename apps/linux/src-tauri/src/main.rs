@@ -171,7 +171,29 @@ fn is_active_onboarding_url(url: &Url) -> bool {
 struct BuildInfo {
     version: String,
     release_build: bool,
+    /// Whether this app shipped a fully self-contained runtime archive
+    /// (portable Node.js + agent + bundled `@openclaw/ai` + dependencies).
+    /// The first-run UI uses this to install silently and open chat directly,
+    /// with no release-channel picker or "Install OpenClaw" step.
+    bundled_runtime: bool,
     platform: &'static str,
+}
+
+/// True when a bundled runtime archive resource is present. Checked across the
+/// known resource locations so the answer is identical on every platform; the
+/// archive itself is only ever used on Windows.
+fn has_bundled_runtime(app: &AppHandle) -> bool {
+    let candidates = [
+        tauri::path::BaseDirectory::Resource,
+        tauri::path::BaseDirectory::App,
+        tauri::path::BaseDirectory::AppLocalData,
+    ];
+    candidates.into_iter().any(|base| {
+        app.path()
+            .resolve("openclaw-runtime.zip", base)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    })
 }
 
 fn is_release_version(version: &str) -> bool {
@@ -3110,6 +3132,7 @@ fn build_info(app: AppHandle) -> BuildInfo {
     let version = app.package_info().version.to_string();
     BuildInfo {
         release_build: is_release_version(&version),
+        bundled_runtime: has_bundled_runtime(&app),
         version,
         platform: std::env::consts::OS,
     }

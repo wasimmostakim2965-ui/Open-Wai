@@ -65,6 +65,12 @@ let discoveryPending = false;
 let discoverySignature = null;
 let firstRunBuild = null;
 let firstRunPhase = null;
+// True when this app shipped a fully self-contained runtime archive. Such a
+// build never shows the first-run welcome wizard (release-channel picker +
+// "Install OpenClaw"); it installs and starts the local Gateway silently and
+// opens chat directly. The Linux CI development binary is unbundled, so it
+// keeps the wizard the native smoke test exercises.
+let hasBundledRuntime = false;
 let selectedConnection = "local";
 let remoteTransport = "direct";
 let remoteConnectionPending = false;
@@ -96,7 +102,11 @@ function render({
     firstRunBuild?.platform === "freebsd"
       ? "Installs the CLI in ~/.openclaw using your system Node.js and npm."
       : "Installs the CLI and managed Node runtime in ~/.openclaw.";
-  show(elements.installControls, showInstall);
+  // A release build, or any build shipping the self-contained runtime, never
+  // exposes a manual "Install OpenClaw" control or a release-channel picker;
+  // failure surfaces as a plain retry instead.
+  const manualInstall = showInstall && !hasBundledRuntime && firstRunBuild?.releaseBuild === false;
+  show(elements.installControls, manualInstall);
   show(elements.actionControls, false);
   show(elements.editConnection, false);
   show(elements.welcomeScreen, false);
@@ -299,18 +309,19 @@ async function connect() {
     if (snapshot.phase === "missingCli" || snapshot.phase === "unconfigured") {
       firstRunPhase = snapshot.phase;
       firstRunBuild = await invoke("build_info").catch(() => null);
-      if (firstRunBuild?.releaseBuild === false) {
+      hasBundledRuntime = firstRunBuild?.bundledRuntime === true;
+      if (firstRunBuild?.releaseBuild === false && !hasBundledRuntime) {
         elements.channel.value = "dev";
-        // A development build cannot auto-install itself: it has no stamped
-        // release version and its bundled package is a branch snapshot. Keep the
-        // existing first-run wizard for those builds (the CI development smoke
-        // relies on it).
+        // A development build without a bundled runtime cannot auto-install
+        // itself: it has no stamped release version and its bundled package is
+        // a branch snapshot. Keep the first-run wizard for those builds (the
+        // Linux CI development smoke relies on it).
         renderWelcome();
       } else {
-        // A stamped release build (the shipped installer) goes straight to chat:
-        // no welcome, no "on this computer / on another computer" question, no
-        // release-channel picker. It installs and starts the local Gateway
-        // silently and opens the dashboard.
+        // A stamped release build, or any build shipping the self-contained
+        // runtime, goes straight to chat: no welcome, no "on this computer /
+        // on another computer" question, no release-channel picker. It installs
+        // and starts the local Gateway silently and opens the dashboard.
         void beginAutoSetup();
       }
     } else if (snapshot.phase === "remoteError") {
