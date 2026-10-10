@@ -1,0 +1,772 @@
+import { createCipheriv, createHash, createHmac, hkdfSync, randomBytes } from "node:crypto";
+import path from "node:path";
+import { adminAuthError, createServerClose, constantTimeTokenEqual, drainRequestBody, hasAdminToken, InvalidJsonBodyError, isJsonObject, isLoopbackHost, jsonResponse, parseUnknownRequestBody, queryRecord, readTrimmedString, RequestBodyTooLargeError, startHttpJsonServer, } from "./http.js";
+import { createServerRecorder, ServerRecorderCommittedError, } from "./recorder.js";
+import { attachWhatsAppBaileysWebSocketServer, resolveMaxPendingWhatsAppInboundMessages, } from "./whatsapp-baileys-websocket.js";
+import { canonicalizeWhatsAppChatJid, canonicalizeWhatsAppUserCorrelationJid, canonicalizeWhatsAppUserJid, isWhatsAppGroupJid, } from "./whatsapp-jid.js";
+const WHATSAPP_CLOUD_RECIPIENT_RE = /^\d{7,15}$/u;
+const WHATSAPP_GRAPH_VERSION_RE = /^v\d+\.\d+$/u;
+const WHATSAPP_GENERATED_MESSAGE_ID_RE = /^wamid\.FAKE(\d{8,})$/u;
+const DEFAULT_GRAPH_VERSION = "v25.0";
+const MAX_WHATSAPP_READABLE_MESSAGE_IDS = 10_000;
+const MAX_WHATSAPP_RECENT_MESSAGE_IDS = 10_000;
+const MAX_WHATSAPP_MESSAGE_ID_BYTES = 128;
+const MAX_WHATSAPP_TEXT_MESSAGE_CHARACTERS = 4_096;
+const MAX_WHATSAPP_MEDIA_FIXTURES = 1_000;
+const MAX_WHATSAPP_MEDIA_BYTES = 16 * 1024 * 1024;
+const WHATSAPP_MEDIA_TTL_MS = 5 * 60 * 1_000;
+const WHATSAPP_MEDIA_DOWNLOAD_GRACE_MS = 30 * 1_000;
+function createDefaultAccessToken() {
+    return `EAA${randomBytes(24).toString("base64url")}`;
+}
+function whatsappOk(value = {}) {
+    return jsonResponse({ ok: true, ...value });
+}
+function graphError(params) {
+    return jsonResponse({
+        error: {
+            code: params.code ?? 100,
+            ...(params.details
+                ? {
+                    error_data: {
+                        details: params.details,
+                        messaging_product: "whatsapp",
+                    },
+                }
+                : {}),
+            fbtrace_id: "A1B2C3D4E5F",
+            message: params.message,
+            type: params.type ?? "OAuthException",
+        },
+    }, params.status ?? 400);
+}
+function graphParameterError(message, details) {
+    return graphError({ code: 100, details, message, status: 400 });
+}
+function graphAuthError() {
+    return graphError({
+        code: 190,
+        message: "Invalid OAuth access token.",
+        status: 401,
+    });
+}
+async function appendEvent(state, event) {
+    await state.recorder.record(event);
+}
+function requireWhatsAppChatJid(value) {
+    const stringValue = readTrimmedString(value);
+    const canonical = stringValue ? canonicalizeWhatsAppChatJid(stringValue) : undefined;
+    if (!canonical) {
+        return graphParameterError("(#100) Invalid parameter: chatJid", "chatJid must be a WhatsApp user or group JID.");
+    }
+    return canonical;
+}
+function requireWhatsAppSenderJid(value) {
+    const stringValue = readTrimmedString(value);
+    const canonical = stringValue ? canonicalizeWhatsAppUserJid(stringValue) : undefined;
+    if (!canonical) {
+        return graphParameterError("(#100) Invalid parameter: senderJid", "senderJid must be a WhatsApp user JID.");
+    }
+    return canonical;
+}
+function requireCloudRecipient(value) {
+    const recipient = readTrimmedString(value);
+    if (!recipient || !WHATSAPP_CLOUD_RECIPIENT_RE.test(recipient)) {
+        return graphParameterError("(#100) Invalid parameter: to", "to must be a WhatsApp phone number in international format without punctuation.");
+    }
+    return recipient;
+}
+function requireAuth(request, state) {
+    const authorization = request.headers.authorization;
+    if (typeof authorization !== "string") {
+        return false;
+    }
+    const match = /^Bearer +(.+)$/iu.exec(authorization.trimStart());
+    const providedToken = match?.[1];
+    return providedToken ? constantTimeTokenEqual(providedToken, state.accessToken) : false;
+}
+/** @internal */
+export function isWhatsAppMessageIdInUse(state, id) {
+    return (state.inboundMessageIds.has(id) ||
+        state.pendingMessageIds.has(id) ||
+        state.recentMessageIds.has(id));
+}
+function reserveMessageId(state, requestedId) {
+    let id = requestedId;
+    if (id) {
+        if (Buffer.byteLength(id, "utf8") > MAX_WHATSAPP_MESSAGE_ID_BYTES) {
+            return graphParameterError("(#100) Invalid parameter: messageId", `messageId must not exceed ${MAX_WHATSAPP_MESSAGE_ID_BYTES} UTF-8 bytes.`);
+        }
+        if (isWhatsAppMessageIdInUse(state, id)) {
+            return graphParameterError("(#100) Invalid parameter: messageId", "messageId must be unique within this WhatsApp server.");
+        }
+    }
+    else {
+        do {
+            id = `wamid.FAKE${String(state.nextMessageId++).padStart(8, "0")}`;
+        } while (isWhatsAppMessageIdInUse(state, id));
+    }
+    state.pendingMessageIds.add(id);
+    let settled = false;
+    return {
+        cancel() {
+            if (!settled) {
+                settled = true;
+                state.pendingMessageIds.delete(id);
+            }
+        },
+        commit() {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            state.pendingMessageIds.delete(id);
+            state.recentMessageIds.delete(id);
+            state.recentMessageIds.set(id, true);
+            if (state.recentMessageIds.size > MAX_WHATSAPP_RECENT_MESSAGE_IDS) {
+                const oldestId = state.recentMessageIds.keys().next().value;
+                if (oldestId !== undefined) {
+                    state.recentMessageIds.delete(oldestId);
+                }
+            }
+            const generatedSequence = WHATSAPP_GENERATED_MESSAGE_ID_RE.exec(id)?.[1];
+            if (generatedSequence) {
+                const sequence = BigInt(generatedSequence);
+                if (sequence >= state.nextMessageId) {
+                    state.nextMessageId = sequence + 1n;
+                }
+            }
+        },
+        id,
+    };
+}
+function waIdFromJid(jid) {
+    const correlationJid = canonicalizeWhatsAppUserCorrelationJid(jid);
+    return correlationJid?.split("@", 1)[0] ?? jid;
+}
+function directPeerIdentity(jid) {
+    return canonicalizeWhatsAppUserCorrelationJid(jid) ?? jid;
+}
+function requireMessagingProduct(body) {
+    const messagingProduct = readTrimmedString(body.messaging_product);
+    if (messagingProduct !== "whatsapp") {
+        return graphParameterError("(#100) Invalid parameter: messaging_product", 'messaging_product must be "whatsapp".');
+    }
+    return undefined;
+}
+function readTextMessageBody(body) {
+    const type = readTrimmedString(body.type);
+    if (!type) {
+        return graphParameterError("(#100) Missing required parameter: type", 'A WhatsApp text send requires type to be "text".');
+    }
+    if (type !== "text") {
+        return graphParameterError("(#100) Unsupported message type", "This test API currently supports WhatsApp text message sends.");
+    }
+    const textPayload = body.text;
+    const text = textPayload && typeof textPayload === "object"
+        ? readMessageText(textPayload.body)
+        : undefined;
+    if (text === undefined) {
+        return graphParameterError("(#100) Missing required parameter: text.body", "A WhatsApp text send requires text.body.");
+    }
+    if ([...text].length > MAX_WHATSAPP_TEXT_MESSAGE_CHARACTERS) {
+        return graphParameterError("(#100) Invalid parameter: text.body", `text.body must not exceed ${MAX_WHATSAPP_TEXT_MESSAGE_CHARACTERS} characters.`);
+    }
+    return text;
+}
+function createWhatsAppMessage(params) {
+    return {
+        key: {
+            fromMe: params.fromMe,
+            id: params.id,
+            ...(params.senderJid ? { participant: params.senderJid } : {}),
+            remoteJid: params.remoteJid,
+        },
+        message: {
+            conversation: params.text,
+        },
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        pushName: params.pushName ?? (params.fromMe ? "Test Bot" : "Test User"),
+    };
+}
+function readAdminAudio(value) {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (!isJsonObject(value)) {
+        return graphParameterError("(#100) Invalid parameter: audio", "audio must be an object containing inline base64 content and an audio MIME type.");
+    }
+    const contentBase64 = typeof value.contentBase64 === "string" ? value.contentBase64 : undefined;
+    if (!contentBase64 ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(contentBase64)) {
+        return graphParameterError("(#100) Invalid parameter: audio.contentBase64", "audio.contentBase64 must contain non-empty canonical base64.");
+    }
+    const mimeType = readTrimmedString(value.mimeType);
+    if (!mimeType?.toLowerCase().startsWith("audio/")) {
+        return graphParameterError("(#100) Invalid parameter: audio.mimeType", "audio.mimeType must be an audio MIME type.");
+    }
+    if (value.ptt !== undefined && typeof value.ptt !== "boolean") {
+        return graphParameterError("(#100) Invalid parameter: audio.ptt", "audio.ptt must be a boolean when provided.");
+    }
+    const content = Buffer.from(contentBase64, "base64");
+    if (content.byteLength === 0 || content.toString("base64") !== contentBase64) {
+        return graphParameterError("(#100) Invalid parameter: audio.contentBase64", "audio.contentBase64 must decode to non-empty content.");
+    }
+    return { content, mimeType, ptt: value.ptt ?? false };
+}
+function createWhatsAppAudioFixture(params) {
+    const mediaKey = randomBytes(32);
+    const expandedKey = Buffer.from(hkdfSync("sha256", mediaKey, Buffer.alloc(32), Buffer.from("WhatsApp Audio Keys", "utf8"), 112));
+    const iv = expandedKey.subarray(0, 16);
+    const cipherKey = expandedKey.subarray(16, 48);
+    const macKey = expandedKey.subarray(48, 80);
+    const cipher = createCipheriv("aes-256-cbc", cipherKey, iv);
+    const ciphertext = Buffer.concat([cipher.update(params.audio.content), cipher.final()]);
+    const mac = createHmac("sha256", macKey).update(iv).update(ciphertext).digest().subarray(0, 10);
+    const encrypted = Buffer.concat([ciphertext, mac]);
+    const mediaCapability = randomBytes(32).toString("base64url");
+    const encodedMessageId = Buffer.from(params.messageId, "utf8").toString("base64url");
+    const mediaPath = `/_crabline/media/whatsapp/${encodedMessageId}/${mediaCapability}`;
+    return {
+        audioMessage: {
+            fileEncSha256: createHash("sha256").update(encrypted).digest(),
+            fileLength: params.audio.content.byteLength,
+            fileSha256: createHash("sha256").update(params.audio.content).digest(),
+            mediaKey,
+            mediaKeyTimestamp: Math.floor(Date.now() / 1_000),
+            mimetype: params.audio.mimeType,
+            ptt: params.audio.ptt,
+            url: `${params.state.baseUrl}${mediaPath}`,
+        },
+        mediaFixture: {
+            content: encrypted,
+            mimeType: "application/octet-stream",
+            path: mediaPath,
+        },
+    };
+}
+function removeWhatsAppMedia(state, mediaPath) {
+    const fixture = state.mediaByPath.get(mediaPath);
+    if (!fixture) {
+        return;
+    }
+    state.mediaByPath.delete(mediaPath);
+    state.mediaBytes -= fixture.content.byteLength;
+}
+function purgeExpiredWhatsAppMedia(state, now = Date.now()) {
+    for (const [mediaPath, fixture] of state.mediaByPath) {
+        if (fixture.expiresAt <= now) {
+            removeWhatsAppMedia(state, mediaPath);
+        }
+    }
+}
+function reserveWhatsAppMedia(state, fixture) {
+    purgeExpiredWhatsAppMedia(state);
+    if (state.mediaByPath.size >= MAX_WHATSAPP_MEDIA_FIXTURES ||
+        state.mediaBytes + fixture.content.byteLength > MAX_WHATSAPP_MEDIA_BYTES) {
+        return false;
+    }
+    state.mediaByPath.set(fixture.path, {
+        content: fixture.content,
+        expiresAt: Date.now() + WHATSAPP_MEDIA_TTL_MS,
+        mimeType: fixture.mimeType,
+    });
+    state.mediaBytes += fixture.content.byteLength;
+    return true;
+}
+function prepareSendMessage(params) {
+    const productError = requireMessagingProduct(params.body);
+    if (productError) {
+        return productError;
+    }
+    const recipientType = readTrimmedString(params.body.recipient_type);
+    if (recipientType && recipientType !== "individual") {
+        return graphParameterError("(#100) Invalid parameter: recipient_type", 'recipient_type must be "individual".');
+    }
+    const to = requireCloudRecipient(params.body.to);
+    if (to instanceof Response) {
+        return to;
+    }
+    const text = readTextMessageBody(params.body);
+    if (text instanceof Response) {
+        return text;
+    }
+    return {
+        commit() {
+            const reservation = reserveMessageId(params.state);
+            if (reservation instanceof Response) {
+                return reservation;
+            }
+            reservation.commit();
+            const message = createWhatsAppMessage({
+                fromMe: true,
+                id: reservation.id,
+                remoteJid: `${to}@s.whatsapp.net`,
+                text,
+            });
+            return jsonResponse({
+                contacts: [
+                    {
+                        input: to,
+                        wa_id: to,
+                    },
+                ],
+                messages: [{ id: message.key.id }],
+                messaging_product: "whatsapp",
+            });
+        },
+    };
+}
+function handleMessageStatus(state, body) {
+    const productError = requireMessagingProduct(body);
+    if (productError) {
+        return productError;
+    }
+    if (readTrimmedString(body.status) !== "read") {
+        return graphParameterError("(#100) Invalid parameter: status", 'status must be "read" for message status updates.');
+    }
+    const messageId = readTrimmedString(body.message_id);
+    if (!messageId) {
+        return graphParameterError("(#100) Missing required parameter: message_id", "A message status update requires message_id.");
+    }
+    if (!state.inboundMessageIds.has(messageId)) {
+        return graphParameterError("(#100) Invalid parameter: message_id", "message_id must reference an accepted inbound message.");
+    }
+    return jsonResponse({ success: true });
+}
+function rememberInboundMessageId(state, messageId) {
+    state.inboundMessageIds.delete(messageId);
+    state.inboundMessageIds.add(messageId);
+    if (state.inboundMessageIds.size > MAX_WHATSAPP_READABLE_MESSAGE_IDS) {
+        const oldest = state.inboundMessageIds.values().next().value;
+        if (oldest !== undefined) {
+            state.inboundMessageIds.delete(oldest);
+        }
+    }
+}
+async function handleAdminInbound(params) {
+    const chatJid = requireWhatsAppChatJid(params.body.chatJid ?? params.body.chatId);
+    if (chatJid instanceof Response) {
+        return { response: chatJid };
+    }
+    const senderJid = requireWhatsAppSenderJid(params.body.senderJid ?? params.body.from);
+    if (senderJid instanceof Response) {
+        return { response: senderJid };
+    }
+    if (directPeerIdentity(senderJid) === directPeerIdentity(params.state.selfJid)) {
+        return {
+            response: graphParameterError("(#100) Invalid parameter: senderJid", "senderJid must not identify the configured WhatsApp self identity."),
+        };
+    }
+    const isGroupChat = isWhatsAppGroupJid(chatJid);
+    if (!isGroupChat && directPeerIdentity(chatJid) !== directPeerIdentity(senderJid)) {
+        return {
+            response: graphParameterError("(#100) Invalid parameter: senderJid", "senderJid must identify the direct chat peer."),
+        };
+    }
+    const text = readMessageText(params.body.text);
+    const audio = readAdminAudio(params.body.audio);
+    if (audio instanceof Response) {
+        return { response: audio };
+    }
+    if ((text === undefined) === (audio === undefined)) {
+        return {
+            response: graphParameterError("(#100) Invalid inbound WhatsApp event", "An inbound WhatsApp event requires exactly one of text or audio."),
+        };
+    }
+    const messageIdReservation = reserveMessageId(params.state, readTrimmedString(params.body.messageId));
+    if (messageIdReservation instanceof Response) {
+        return { response: messageIdReservation };
+    }
+    const messageBase = {
+        key: {
+            fromMe: false,
+            id: messageIdReservation.id,
+            ...(isGroupChat ? { participant: senderJid } : {}),
+            remoteJid: isGroupChat ? chatJid : directPeerIdentity(chatJid),
+        },
+        messageTimestamp: Math.floor(Date.now() / 1_000),
+        pushName: readTrimmedString(params.body.pushName) ?? "Test User",
+    };
+    const audioFixture = audio
+        ? createWhatsAppAudioFixture({ audio, messageId: messageIdReservation.id, state: params.state })
+        : undefined;
+    const message = text
+        ? createWhatsAppMessage({
+            fromMe: false,
+            id: messageIdReservation.id,
+            pushName: messageBase.pushName,
+            remoteJid: messageBase.key.remoteJid,
+            senderJid: isGroupChat ? senderJid : undefined,
+            text,
+        })
+        : {
+            ...messageBase,
+            message: { audioMessage: audioFixture.audioMessage },
+        };
+    const timestamp = String(message.messageTimestamp);
+    const webhook = {
+        entry: [
+            {
+                changes: [
+                    {
+                        field: "messages",
+                        value: {
+                            contacts: [
+                                {
+                                    profile: { name: readTrimmedString(params.body.pushName) ?? "Test User" },
+                                    wa_id: waIdFromJid(senderJid),
+                                },
+                            ],
+                            messages: [
+                                {
+                                    from: waIdFromJid(senderJid),
+                                    id: message.key.id,
+                                    ...(text
+                                        ? { text: { body: text }, type: "text" }
+                                        : {
+                                            audio: {
+                                                id: message.key.id,
+                                                mime_type: audio.mimeType,
+                                            },
+                                            type: "audio",
+                                        }),
+                                    timestamp,
+                                },
+                            ],
+                            messaging_product: "whatsapp",
+                            metadata: {
+                                display_phone_number: params.state.displayPhoneNumber,
+                                phone_number_id: params.state.phoneNumberId,
+                            },
+                        },
+                    },
+                ],
+                id: "TEST_WABA",
+            },
+        ],
+        object: "whatsapp_business_account",
+    };
+    return {
+        mediaFixture: audioFixture?.mediaFixture,
+        message,
+        messageIdReservation,
+        webhook,
+    };
+}
+async function handleRequest(params) {
+    const url = new URL(params.request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname.startsWith("/_crabline/media/whatsapp/")) {
+        if (params.request.method !== "GET") {
+            drainRequestBody(params.request);
+            return new Response("not found", { status: 404 });
+        }
+        purgeExpiredWhatsAppMedia(params.state);
+        const fixture = params.state.mediaByPath.get(url.pathname);
+        if (fixture) {
+            fixture.expiresAt = Math.min(fixture.expiresAt, Date.now() + WHATSAPP_MEDIA_DOWNLOAD_GRACE_MS);
+        }
+        return fixture
+            ? new Response(new Uint8Array(fixture.content), {
+                headers: { "content-type": fixture.mimeType },
+            })
+            : new Response("not found", { status: 404 });
+    }
+    if (url.pathname === "/_crabline/admin/whatsapp/inbound") {
+        if (params.request.method !== "POST") {
+            drainRequestBody(params.request);
+            return new Response("not found", { status: 404 });
+        }
+        if (!hasAdminToken(params.request, params.state.adminToken)) {
+            drainRequestBody(params.request);
+            return adminAuthError();
+        }
+        const body = await parseUnknownRequestBody(params.request);
+        if (!isJsonObject(body)) {
+            return graphParameterError("(#100) Invalid parameter: request body", "The request body must be a JSON object.");
+        }
+        const result = await handleAdminInbound({ body, state: params.state });
+        if (result.response) {
+            return result.response;
+        }
+        const event = {
+            at: new Date().toISOString(),
+            body,
+            method: params.request.method,
+            path: url.pathname,
+            query: queryRecord(url),
+            type: "admin",
+        };
+        const preparedDelivery = result.message
+            ? params.state.prepareInboundMessage(result.message)
+            : undefined;
+        if (result.message && !preparedDelivery) {
+            result.messageIdReservation?.cancel();
+            return graphError({
+                code: 4,
+                details: "The pending WhatsApp inbound queue is full.",
+                message: "(#4) Application request limit reached.",
+                status: 503,
+                type: "OAuthException",
+            });
+        }
+        if (result.mediaFixture && !reserveWhatsAppMedia(params.state, result.mediaFixture)) {
+            preparedDelivery?.cancel();
+            result.messageIdReservation?.cancel();
+            return graphError({
+                code: 4,
+                details: "The WhatsApp media fixture capacity is full.",
+                message: "(#4) Application request limit reached.",
+                status: 503,
+                type: "OAuthException",
+            });
+        }
+        if (result.message) {
+            event.message = result.message;
+        }
+        try {
+            await appendEvent(params.state, event);
+        }
+        catch (error) {
+            if (!(error instanceof ServerRecorderCommittedError)) {
+                preparedDelivery?.cancel();
+                if (result.mediaFixture) {
+                    removeWhatsAppMedia(params.state, result.mediaFixture.path);
+                }
+                result.messageIdReservation?.cancel();
+                throw error;
+            }
+            result.messageIdReservation?.commit();
+            if (result.message && preparedDelivery) {
+                try {
+                    await preparedDelivery.commit();
+                    rememberInboundMessageId(params.state, result.message.key.id);
+                }
+                catch (deliveryError) {
+                    const reconciliationError = new AggregateError([error, deliveryError], "WhatsApp recorder append committed, but inbound delivery reconciliation failed.");
+                    reconciliationError.cause = deliveryError;
+                    throw reconciliationError;
+                }
+            }
+            throw error;
+        }
+        if (result.message && preparedDelivery) {
+            try {
+                const delivery = await preparedDelivery.commit();
+                result.messageIdReservation?.commit();
+                rememberInboundMessageId(params.state, result.message.key.id);
+                return whatsappOk({ delivery, message: result.message, webhook: result.webhook });
+            }
+            catch (error) {
+                if (result.mediaFixture) {
+                    removeWhatsAppMedia(params.state, result.mediaFixture.path);
+                }
+                result.messageIdReservation?.cancel();
+                throw error;
+            }
+        }
+        if (result.mediaFixture) {
+            removeWhatsAppMedia(params.state, result.mediaFixture.path);
+        }
+        result.messageIdReservation?.cancel();
+        return graphParameterError("(#100) Invalid inbound WhatsApp event");
+    }
+    const phoneNumberPath = `/${params.state.graphVersion}/${params.state.phoneNumberId}`;
+    const messagesPath = `${phoneNumberPath}/messages`;
+    if (!requireAuth(params.request, params.state)) {
+        drainRequestBody(params.request);
+        return graphAuthError();
+    }
+    if (url.pathname === phoneNumberPath && params.request.method === "GET") {
+        const body = queryRecord(url);
+        await appendEvent(params.state, {
+            accepted: true,
+            at: new Date().toISOString(),
+            body,
+            method: params.request.method,
+            path: url.pathname,
+            query: body,
+            type: "api",
+        });
+        return jsonResponse({
+            display_phone_number: params.state.displayPhoneNumber,
+            id: params.state.phoneNumberId,
+            quality_rating: "GREEN",
+            verified_name: "Crabline Test Bot",
+        });
+    }
+    if (url.pathname === messagesPath) {
+        if (params.request.method !== "POST") {
+            drainRequestBody(params.request);
+            return new Response("not found", { status: 404 });
+        }
+        const body = await parseUnknownRequestBody(params.request);
+        const event = {
+            at: new Date().toISOString(),
+            body,
+            method: params.request.method,
+            path: url.pathname,
+            query: queryRecord(url),
+            type: "api",
+        };
+        let response;
+        if (!isJsonObject(body)) {
+            response = graphParameterError("(#100) Invalid parameter: request body", "The request body must be a JSON object.");
+        }
+        else if ("status" in body || "message_id" in body) {
+            response = handleMessageStatus(params.state, body);
+            event.accepted = response.ok;
+        }
+        else {
+            const prepared = prepareSendMessage({ body, state: params.state });
+            if (!(prepared instanceof Response)) {
+                response = prepared.commit();
+                event.accepted = true;
+                await appendEvent(params.state, event);
+                return response;
+            }
+            response = prepared;
+        }
+        event.accepted ??= false;
+        await appendEvent(params.state, event);
+        return response;
+    }
+    drainRequestBody(params.request);
+    return new Response("not found", { status: 404 });
+}
+export async function startWhatsAppServer(params = {}) {
+    const host = params.host ?? "127.0.0.1";
+    if (!isLoopbackHost(host)) {
+        throw new Error("WhatsApp server requires a loopback host because its HTTP and WebSocket endpoints carry credentials over cleartext.");
+    }
+    if (params.accessToken !== undefined &&
+        (!params.accessToken.trim() || params.accessToken !== params.accessToken.trim())) {
+        throw new Error("WhatsApp accessToken must not be empty or whitespace-padded.");
+    }
+    if (params.adminToken !== undefined &&
+        (!params.adminToken.trim() || params.adminToken !== params.adminToken.trim())) {
+        throw new Error("WhatsApp adminToken must not be empty or whitespace-padded.");
+    }
+    const graphVersion = params.graphVersion ?? DEFAULT_GRAPH_VERSION;
+    if (!WHATSAPP_GRAPH_VERSION_RE.test(graphVersion)) {
+        throw new Error(`Invalid WhatsApp Graph API version: ${graphVersion}.`);
+    }
+    const phoneNumberId = params.phoneNumberId ?? "100000000000000";
+    if (!/^\d+$/u.test(phoneNumberId)) {
+        throw new Error("WhatsApp phoneNumberId must contain only digits.");
+    }
+    const maxPendingInboundMessages = resolveMaxPendingWhatsAppInboundMessages(params.maxPendingInboundMessages);
+    const selfJid = canonicalizeWhatsAppUserJid(params.selfJid ?? "15550000000@s.whatsapp.net");
+    if (!selfJid) {
+        throw new Error("WhatsApp selfJid must be a WhatsApp user JID.");
+    }
+    const recorderPath = params.recorderPath ?? path.resolve(".crabline", "servers", "whatsapp.jsonl");
+    const state = {
+        accessToken: params.accessToken ?? createDefaultAccessToken(),
+        adminToken: params.adminToken ?? randomBytes(24).toString("hex"),
+        baseUrl: "",
+        prepareInboundMessage: () => undefined,
+        displayPhoneNumber: params.displayPhoneNumber ?? "15550000000",
+        graphVersion,
+        inboundMessageIds: new Set(),
+        mediaByPath: new Map(),
+        mediaBytes: 0,
+        pendingMessageIds: new Set(),
+        recentMessageIds: new Map(),
+        nextMessageId: 1n,
+        recorder: createServerRecorder({ recorderPath, onEvent: params.onEvent }),
+        phoneNumberId,
+        recorderPath,
+        selfJid,
+    };
+    const httpServer = await startHttpJsonServer({
+        handle: (request) => handleRequest({ request, state }),
+        handleError: (error) => {
+            if (error instanceof InvalidJsonBodyError) {
+                return graphParameterError("(#100) Invalid parameter: request body", "The request body must be valid JSON.");
+            }
+            if (error instanceof RequestBodyTooLargeError) {
+                return graphError({
+                    code: 100,
+                    details: "The request body exceeds the supported size limit.",
+                    message: "(#100) Request body is too large.",
+                    status: 413,
+                });
+            }
+            return undefined;
+        },
+        host,
+        port: params.port ?? 0,
+        serverName: "WhatsApp",
+    });
+    const baseUrl = httpServer.baseUrl;
+    state.baseUrl = baseUrl;
+    const apiRoot = `${baseUrl}/${state.graphVersion}`;
+    const phoneNumberUrl = `${apiRoot}/${state.phoneNumberId}`;
+    const messagesUrl = `${phoneNumberUrl}/messages`;
+    const baileysWebSocketUrl = `${baseUrl.replace(/^http/u, "ws")}/ws/chat?access_token=${encodeURIComponent(state.accessToken)}`;
+    const baileysWebSocketOptions = {
+        accessToken: state.accessToken,
+        appendEvent: (event) => appendEvent(state, event),
+        httpServer: httpServer.server,
+        maxPendingInboundMessages,
+        messageAcceptanceTimeoutMs: params.messageAcceptanceTimeoutMs,
+        path: "/ws/chat",
+        selfJid: state.selfJid,
+    };
+    let baileysWebSocketServer;
+    try {
+        baileysWebSocketServer = attachWhatsAppBaileysWebSocketServer(baileysWebSocketOptions);
+    }
+    catch (error) {
+        try {
+            await httpServer.close();
+        }
+        catch (closeError) {
+            const aggregateError = new AggregateError([error, closeError], "WhatsApp WebSocket startup failed and HTTP rollback also failed.");
+            aggregateError.cause = error;
+            throw aggregateError;
+        }
+        throw error;
+    }
+    state.prepareInboundMessage = (message) => baileysWebSocketServer.prepareInboundMessage(message);
+    return {
+        close: createServerClose(state.recorder, async () => {
+            try {
+                await baileysWebSocketServer.close();
+            }
+            finally {
+                state.mediaByPath.clear();
+                state.mediaBytes = 0;
+            }
+        }, () => httpServer.close()),
+        manifest: {
+            accessToken: state.accessToken,
+            adminToken: state.adminToken,
+            baseUrl,
+            endpoints: {
+                adminInboundUrl: `${baseUrl}/_crabline/admin/whatsapp/inbound`,
+                apiRoot,
+                baileysWebSocketUrl,
+                messagesUrl,
+                phoneNumberUrl,
+            },
+            env: {
+                CLOUD_API_ACCESS_TOKEN: state.accessToken,
+                CLOUD_API_VERSION: state.graphVersion,
+                WA_BASE_URL: baseUrl,
+                WA_PHONE_NUMBER_ID: state.phoneNumberId,
+            },
+            graphVersion: state.graphVersion,
+            phoneNumberId: state.phoneNumberId,
+            provider: "whatsapp",
+            recorderPath: state.recorderPath,
+            selfJid: state.selfJid,
+            version: 1,
+        },
+    };
+}
+function readMessageText(value) {
+    return typeof value === "string" && value.trim() ? value : undefined;
+}
+//# sourceMappingURL=whatsapp.js.map

@@ -1,0 +1,213 @@
+import { createAdminInboundRequest, createOpenClawCrablineProviderBridge, DEFAULT_ACCOUNT_ID, isRecord, qaTargetForInbound, readNonBlankString, readString, } from "../shared.js";
+import { canonicalizeWhatsAppChatCorrelationJid, canonicalizeWhatsAppChatJid, canonicalizeWhatsAppUserCorrelationJid, canonicalizeWhatsAppUserJid, } from "../../servers/whatsapp-jid.js";
+import { throwProbeHttpError } from "./probe-response.js";
+function requireWhatsAppJid(value, label, userOnly = false) {
+    const canonical = userOnly
+        ? canonicalizeWhatsAppUserJid(value)
+        : canonicalizeWhatsAppChatJid(value);
+    if (!canonical) {
+        throw new Error(`${label} must be a native WhatsApp JID.`);
+    }
+    return canonical;
+}
+function requireWhatsAppTargetKind(parsed, targetId) {
+    if (parsed.native && parsed.kind === "direct") {
+        return;
+    }
+    const nativeKind = targetId.endsWith("@g.us") ? "group" : "direct";
+    if (parsed.kind !== nativeKind) {
+        throw new Error("WhatsApp target kind does not match the native JID.");
+    }
+}
+function requireWhatsAppConversationKind(kind, targetId) {
+    const nativeKind = targetId.endsWith("@g.us") ? "group" : "direct";
+    if (kind !== nativeKind) {
+        throw new Error("WhatsApp inbound conversation kind does not match the native JID.");
+    }
+}
+function whatsappInboundAudio(input) {
+    if (!input.attachments?.length) {
+        return undefined;
+    }
+    if (input.attachments.length !== 1 || input.attachments[0]?.kind !== "audio") {
+        throw new Error("WhatsApp Crabline inbound supports exactly one inline audio attachment.");
+    }
+    const attachment = input.attachments[0];
+    if (!attachment.contentBase64) {
+        throw new Error("WhatsApp Crabline inbound audio requires inline contentBase64.");
+    }
+    return {
+        contentBase64: attachment.contentBase64,
+        ...(attachment.fileName ? { fileName: attachment.fileName } : {}),
+        mimeType: attachment.mimeType,
+        ptt: true,
+    };
+}
+export const WHATSAPP_OPENCLAW_CRABLINE_PROVIDER_BRIDGE = createOpenClawCrablineProviderBridge({
+    allowAttachmentOnlyInbound: true,
+    provider: "whatsapp",
+    createAdapter(whatsapp) {
+        const messagesPath = new URL(whatsapp.endpoints.messagesUrl).pathname;
+        return {
+            async probe(signal) {
+                const response = await fetch(whatsapp.endpoints.phoneNumberUrl, {
+                    headers: {
+                        authorization: `Bearer ${whatsapp.accessToken}`,
+                    },
+                    ...(signal ? { signal } : {}),
+                });
+                if (!response.ok) {
+                    await throwProbeHttpError(response, `Crabline WhatsApp probe failed with HTTP ${response.status}.`);
+                }
+                const payload = await response.json();
+                if (!isRecord(payload) || readString(payload.id) !== whatsapp.phoneNumberId) {
+                    throw new Error("Crabline WhatsApp probe returned an unexpected phone number.");
+                }
+                return payload;
+            },
+            createBinding() {
+                return {
+                    accountId: DEFAULT_ACCOUNT_ID,
+                    channel: "whatsapp",
+                    createProviderReadinessEnv: (env) => ({
+                        ...env,
+                        CRABLINE_WHATSAPP_ADMIN_TOKEN: whatsapp.adminToken,
+                        CRABLINE_WHATSAPP_RECORDER_PATH: whatsapp.recorderPath,
+                        CRABLINE_WHATSAPP_SELF_JID: whatsapp.selfJid,
+                        OPENCLAW_WHATSAPP_WEB_SOCKET_URL: whatsapp.endpoints.baileysWebSocketUrl,
+                    }),
+                    createGatewayConfig: (openclawConfig = {}) => {
+                        const channels = isRecord(openclawConfig.channels) ? openclawConfig.channels : {};
+                        const whatsappConfig = isRecord(channels.whatsapp) ? channels.whatsapp : {};
+                        const groups = isRecord(whatsappConfig.groups) ? whatsappConfig.groups : {};
+                        const defaultGroup = isRecord(groups["*"]) ? groups["*"] : {};
+                        return {
+                            ...openclawConfig,
+                            channels: {
+                                ...channels,
+                                whatsapp: {
+                                    ...whatsappConfig,
+                                    enabled: true,
+                                    dmPolicy: "open",
+                                    groupPolicy: "open",
+                                    allowFrom: ["*"],
+                                    groupAllowFrom: ["*"],
+                                    groups: {
+                                        ...groups,
+                                        "*": {
+                                            ...defaultGroup,
+                                            requireMention: false,
+                                        },
+                                    },
+                                },
+                            },
+                        };
+                    },
+                    requiredPluginIds: ["whatsapp"],
+                };
+            },
+            createAgentDelivery(parsed) {
+                if (parsed.threadId !== undefined) {
+                    throw new Error("WhatsApp does not support thread targets.");
+                }
+                const nativeTo = requireWhatsAppJid(parsed.id, "WhatsApp target");
+                requireWhatsAppTargetKind(parsed, nativeTo);
+                if (nativeTo.endsWith("@g.us")) {
+                    throw new Error("WhatsApp Crabline WebSocket outbound supports direct targets only.");
+                }
+                const to = canonicalizeWhatsAppUserCorrelationJid(nativeTo);
+                return {
+                    channel: "whatsapp",
+                    providerTargetKey: to,
+                    to,
+                    replyChannel: "whatsapp",
+                    replyTo: to,
+                };
+            },
+            createInbound(input) {
+                if (input.threadId !== undefined) {
+                    throw new Error("WhatsApp does not support thread targets.");
+                }
+                const nativeChatJid = requireWhatsAppJid(input.conversation.id, "WhatsApp conversation");
+                requireWhatsAppConversationKind(input.conversation.kind, nativeChatJid);
+                const nativeSenderJid = requireWhatsAppJid(input.senderId, "WhatsApp sender", true);
+                const providerTargetKey = canonicalizeWhatsAppChatCorrelationJid(nativeChatJid);
+                const audio = whatsappInboundAudio(input);
+                if (input.conversation.kind === "direct" &&
+                    canonicalizeWhatsAppUserCorrelationJid(nativeChatJid) !==
+                        canonicalizeWhatsAppUserCorrelationJid(nativeSenderJid)) {
+                    throw new Error("WhatsApp direct conversation and sender must identify the same recipient.");
+                }
+                return {
+                    ...createAdminInboundRequest(whatsapp),
+                    providerBody: {
+                        chatJid: nativeChatJid,
+                        senderJid: nativeSenderJid,
+                        ...(input.senderName ? { pushName: input.senderName } : {}),
+                        ...(audio ? { audio } : { text: input.text }),
+                    },
+                    providerTargetKey,
+                    qaTarget: qaTargetForInbound({
+                        ...input,
+                        conversation: { ...input.conversation, id: providerTargetKey },
+                    }),
+                    stateConversation: {
+                        id: nativeChatJid,
+                        kind: nativeChatJid.endsWith("@g.us") ? "group" : "direct",
+                    },
+                };
+            },
+            createOutboundObservation({ event }) {
+                if (!isRecord(event) ||
+                    event.type !== "api" ||
+                    event.accepted !== true ||
+                    typeof event.path !== "string") {
+                    return null;
+                }
+                if (!isRecord(event.body)) {
+                    return null;
+                }
+                const baileysKey = isRecord(event.body.key) ? event.body.key : undefined;
+                const baileysMessage = isRecord(event.body.message) ? event.body.message : undefined;
+                const isBaileysSend = event.method === "WEBSOCKET" && event.path === "/ws/chat";
+                const messagingProduct = readString(event.body.messaging_product);
+                const messageType = readString(event.body.type);
+                const isCloudTextSend = event.method === "POST" &&
+                    event.path === messagesPath &&
+                    (!("messaging_product" in event.body) || messagingProduct === "whatsapp") &&
+                    (!("type" in event.body) || messageType === "text") &&
+                    !("status" in event.body) &&
+                    !("message_id" in event.body);
+                if (!isBaileysSend && !isCloudTextSend) {
+                    return null;
+                }
+                const to = isBaileysSend ? readString(baileysKey?.remoteJid) : readString(event.body.to);
+                const textPayload = event.body.text;
+                const text = isBaileysSend
+                    ? readNonBlankString(baileysMessage?.conversation)
+                    : isRecord(textPayload)
+                        ? readNonBlankString(textPayload.body)
+                        : undefined;
+                if (!to || !text) {
+                    return null;
+                }
+                const providerTarget = isBaileysSend
+                    ? canonicalizeWhatsAppChatCorrelationJid(to)
+                    : (canonicalizeWhatsAppChatJid(to) ??
+                        (/^\d{7,15}$/u.test(to) ? `${to}@s.whatsapp.net` : to));
+                if (!providerTarget) {
+                    return null;
+                }
+                return {
+                    accountId: DEFAULT_ACCOUNT_ID,
+                    senderId: "openclaw",
+                    senderName: "OpenClaw QA",
+                    text,
+                    providerTargetKeys: [providerTarget],
+                    fallbackTarget: providerTarget,
+                };
+            },
+        };
+    },
+});
+//# sourceMappingURL=whatsapp.js.map

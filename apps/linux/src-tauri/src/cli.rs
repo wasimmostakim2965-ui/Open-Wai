@@ -205,6 +205,10 @@ impl OpenClawCli {
             .collect();
         let mut command = build_command(&self.executable, &args);
         command.env("PATH", self.command_path()?);
+        // This is a self-hosted fork build. Never let a packaged headless node
+        // replace it with the upstream `openclaw@latest` npm artifact; the fork
+        // ships and updates only from its own repository.
+        command.env("OPENCLAW_NO_AUTO_UPDATE", "1");
         command.stdin(Stdio::null());
         Ok(command)
     }

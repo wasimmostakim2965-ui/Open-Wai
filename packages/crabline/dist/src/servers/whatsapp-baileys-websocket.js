@@ -1,0 +1,1887 @@
+import { Buffer } from "node:buffer";
+import { ProtocolAddress, SessionCipher, SessionRecord } from "libsignal";
+import { aesDecryptGCM, aesEncryptGCM, Curve, encodeBigEndian, ensureSignalPublicKey, generateSignalKeyPair, hkdf, NOISE_MODE, NOISE_WA_HEADER, sha256, signedKeyPair, scrubSignalPublicKey, } from "./whatsapp-wire/crypto.js";
+import { decodeBinaryNode, encodeBinaryNode, S_WHATSAPP_NET, } from "./whatsapp-wire/binary-node.js";
+import { decodeHandshakeMessage, encodeHandshakeMessage } from "./whatsapp-wire/handshake.js";
+import { KEY_BUNDLE_TYPE, xmppPreKey, xmppSignedPreKey } from "./whatsapp-wire/signal.js";
+import { WebSocket, WebSocketServer } from "ws";
+import { closeWebSocketServer } from "./websocket.js";
+import { canonicalizeWhatsAppChatCorrelationJid, canonicalizeWhatsAppUserCorrelationJid, } from "./whatsapp-jid.js";
+// Keep the local server independent from Baileys at runtime. Tests use Baileys
+// as a black-box client to verify this narrow WhatsApp Web wire subset.
+const EMPTY_BUFFER = Buffer.alloc(0);
+const IV_LENGTH = 12;
+const MAX_PENDING_INBOUND_MESSAGES = 1_000;
+export const MAX_WHATSAPP_NOISE_FRAME_BYTES = 2 * 1024 * 1024;
+export const MAX_WHATSAPP_WEBSOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
+export const MAX_WHATSAPP_WEBSOCKET_MESSAGE_BYTES = 4 * 1024 * 1024;
+export const MAX_WHATSAPP_NOISE_BUFFER_CHUNKS = 1_024;
+export const MAX_WHATSAPP_NOISE_FRAMES_PER_MESSAGE = 1_024;
+export const WHATSAPP_WEBSOCKET_SEND_TIMEOUT_MS = 5_000;
+const MAX_PENDING_WEBSOCKET_BYTES = 8 * 1024 * 1024;
+const MAX_PENDING_WEBSOCKET_MESSAGES = 32;
+const MAX_WHATSAPP_PENDING_ACKNOWLEDGEMENTS = 10_000;
+const MAX_WHATSAPP_PENDING_ACKNOWLEDGEMENT_AGE_MS = 5 * 60 * 1_000;
+const MAX_WHATSAPP_RECENT_ACKNOWLEDGEMENTS = 10_000;
+const MAX_NODE_TIMER_DELAY_MS = 2_147_483_647;
+export const MAX_WHATSAPP_WEBSOCKET_FRAGMENTS = 1_024;
+export const MAX_WHATSAPP_SIGNAL_BUNDLES = 1_024;
+export const MAX_WHATSAPP_SIGNAL_PREKEYS_PER_BUNDLE = 32;
+export const MAX_WHATSAPP_SIGNAL_SESSIONS_PER_BUNDLE = 32;
+export const MAX_WHATSAPP_WEBSOCKET_CLOSE_REASON_BYTES = 123;
+export const WHATSAPP_MESSAGE_ACCEPTANCE_TIMEOUT_MS = 5_000;
+export const WHATSAPP_SIGNAL_PREKEY_RESERVATION_TTL_MS = 5 * 60 * 1_000;
+const WHATSAPP_NOISE_CERT_CHAIN = Buffer.from("CncKMwjjAhADGiCRKg7Kg1iu4CSulwLBaxX51Tefw6VXGgZqcr5OEbXIRiDQ04bOBijQjZ/TBhJA34Bj82jAHhLpCWBNVBlGnFDieamd8+138S57uMt9ke9mrn5r4+VepwBPKEgHjob6bR70rlCmWDkxZv+CfVjIAxJ2CjIIAxAAGiAcUamsMDmUxsjQuS6hh4pTNHZZnMWZ++o1mX2aqQzOYiCAka6+Bij/3rfcBhJAJw8pRkhTn+1IcOJQVN1OlZg6uikYnCumyO7acFVVX3U3QPXsGSq2TCbCbWrebSC593Su43EgprIDlfU8ZgWFBw==", "base64");
+export function resolveMaxPendingWhatsAppInboundMessages(value) {
+    const resolved = value ?? MAX_PENDING_INBOUND_MESSAGES;
+    if (!Number.isSafeInteger(resolved) || resolved < 1) {
+        throw new Error("WhatsApp maxPendingInboundMessages must be a positive safe integer.");
+    }
+    return resolved;
+}
+async function awaitWithAbort(operation, signal) {
+    if (!signal) {
+        return await operation;
+    }
+    return await new Promise((resolve, reject) => {
+        const abort = () => reject(signal.reason);
+        // The operation already started; even pre-aborted waits must observe its rejection.
+        void operation.then((value) => {
+            signal.removeEventListener("abort", abort);
+            resolve(value);
+        }, (error) => {
+            signal.removeEventListener("abort", abort);
+            reject(error);
+        });
+        signal.throwIfAborted();
+        signal.addEventListener("abort", abort, { once: true });
+    });
+}
+export class WhatsAppSignalBundleStore {
+    maxBundles;
+    maxPendingAcknowledgements;
+    maxRecentAcknowledgements;
+    maxPendingAcknowledgementAgeMs;
+    now;
+    #acknowledgedMessageIds = new Map();
+    #bundles = new Map();
+    #lidByPhoneNumber = new Map();
+    #maxPreKeysPerBundle;
+    #maxSessionsPerBundle;
+    #maxTerminalAcceptances;
+    #messagePreKeyProtections = new Map();
+    #messageAcceptanceTimeoutMs;
+    #pendingAcknowledgements = new Map();
+    #pendingTransactions = new Map();
+    #persistedMessageIds = new Map();
+    #preKeyReservationTtlMs;
+    #sessions = new Map();
+    #terminalAcceptances = new Map();
+    constructor(maxBundles = MAX_WHATSAPP_SIGNAL_BUNDLES, maxPendingAcknowledgements = MAX_WHATSAPP_PENDING_ACKNOWLEDGEMENTS, maxRecentAcknowledgements = MAX_WHATSAPP_RECENT_ACKNOWLEDGEMENTS, maxPendingAcknowledgementAgeMs = MAX_WHATSAPP_PENDING_ACKNOWLEDGEMENT_AGE_MS, now = Date.now, options = {}) {
+        this.maxBundles = maxBundles;
+        this.maxPendingAcknowledgements = maxPendingAcknowledgements;
+        this.maxRecentAcknowledgements = maxRecentAcknowledgements;
+        this.maxPendingAcknowledgementAgeMs = maxPendingAcknowledgementAgeMs;
+        this.now = now;
+        const maxPreKeysPerBundle = options.maxPreKeysPerBundle ?? MAX_WHATSAPP_SIGNAL_PREKEYS_PER_BUNDLE;
+        const maxSessionsPerBundle = options.maxSessionsPerBundle ?? MAX_WHATSAPP_SIGNAL_SESSIONS_PER_BUNDLE;
+        const messageAcceptanceTimeoutMs = options.messageAcceptanceTimeoutMs ?? WHATSAPP_MESSAGE_ACCEPTANCE_TIMEOUT_MS;
+        const preKeyReservationTtlMs = options.preKeyReservationTtlMs ?? WHATSAPP_SIGNAL_PREKEY_RESERVATION_TTL_MS;
+        if (!Number.isSafeInteger(maxBundles) || maxBundles < 1) {
+            throw new Error("WhatsApp maxSignalBundles must be a positive safe integer.");
+        }
+        if (!Number.isSafeInteger(maxSessionsPerBundle) || maxSessionsPerBundle < 1) {
+            throw new Error("WhatsApp maxSignalSessionsPerBundle must be a positive safe integer.");
+        }
+        if (!Number.isSafeInteger(maxPreKeysPerBundle) || maxPreKeysPerBundle < 1) {
+            throw new Error("WhatsApp maxSignalPreKeysPerBundle must be a positive safe integer.");
+        }
+        if (!Number.isSafeInteger(messageAcceptanceTimeoutMs) ||
+            messageAcceptanceTimeoutMs < 1 ||
+            messageAcceptanceTimeoutMs > MAX_NODE_TIMER_DELAY_MS) {
+            throw new Error(`WhatsApp messageAcceptanceTimeoutMs must be a positive integer no greater than ${MAX_NODE_TIMER_DELAY_MS}.`);
+        }
+        if (!Number.isSafeInteger(preKeyReservationTtlMs) || preKeyReservationTtlMs < 1) {
+            throw new Error("WhatsApp preKeyReservationTtlMs must be a positive safe integer.");
+        }
+        if (!Number.isSafeInteger(maxPendingAcknowledgements) || maxPendingAcknowledgements < 1) {
+            throw new Error("WhatsApp maxPendingAcknowledgements must be a positive safe integer.");
+        }
+        if (!Number.isSafeInteger(maxRecentAcknowledgements) || maxRecentAcknowledgements < 1) {
+            throw new Error("WhatsApp maxRecentAcknowledgements must be a positive safe integer.");
+        }
+        if (!Number.isSafeInteger(maxPendingAcknowledgementAgeMs) ||
+            maxPendingAcknowledgementAgeMs < 1) {
+            throw new Error("WhatsApp maxPendingAcknowledgementAgeMs must be a positive safe integer.");
+        }
+        this.#maxPreKeysPerBundle = maxPreKeysPerBundle;
+        this.#maxSessionsPerBundle = maxSessionsPerBundle;
+        this.#maxTerminalAcceptances = Math.min(Number.MAX_SAFE_INTEGER, maxPendingAcknowledgements + maxRecentAcknowledgements);
+        this.#messageAcceptanceTimeoutMs = messageAcceptanceTimeoutMs;
+        this.#preKeyReservationTtlMs = preKeyReservationTtlMs;
+    }
+    get size() {
+        return this.#bundles.size;
+    }
+    get lidMappingSize() {
+        return this.#lidByPhoneNumber.size;
+    }
+    get sessionCount() {
+        let count = 0;
+        for (const sessions of this.#sessions.values()) {
+            count += sessions.size;
+        }
+        return count;
+    }
+    async acceptMessageOnce(messageKey, operation, options = {}) {
+        this.#recoverExpiredPendingAcknowledgements();
+        const pendingAcceptance = this.#pendingAcknowledgements.get(messageKey);
+        if (pendingAcceptance) {
+            return await pendingAcceptance.acceptance;
+        }
+        const terminalAcceptance = this.#terminalAcceptances.get(messageKey);
+        if (terminalAcceptance) {
+            this.#terminalAcceptances.delete(messageKey);
+            this.#terminalAcceptances.set(messageKey, terminalAcceptance);
+            throw terminalAcceptance.error;
+        }
+        if (this.#acknowledgedMessageIds.delete(messageKey)) {
+            this.#acknowledgedMessageIds.set(messageKey, true);
+            return true;
+        }
+        if (this.#terminalAcceptances.size + this.#pendingAcknowledgements.size >=
+            this.#maxTerminalAcceptances) {
+            throw new Error(`WhatsApp terminal acceptance limit exceeded (${this.#maxTerminalAcceptances}).`);
+        }
+        if (this.#pendingAcknowledgements.size >= this.maxPendingAcknowledgements) {
+            throw new Error(`WhatsApp pending acknowledgement limit exceeded (${this.maxPendingAcknowledgements}).`);
+        }
+        const timeoutMs = options.timeoutMs ?? this.#messageAcceptanceTimeoutMs;
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_NODE_TIMER_DELAY_MS) {
+            throw new Error(`WhatsApp message acceptance timeout must be a positive integer no greater than ${MAX_NODE_TIMER_DELAY_MS}.`);
+        }
+        options.signal?.throwIfAborted();
+        const controller = new AbortController();
+        const operationPromise = Promise.resolve().then(() => operation(controller.signal));
+        let terminalFenced = false;
+        const fenceTerminalAcceptance = (error) => {
+            if (terminalFenced) {
+                return;
+            }
+            terminalFenced = true;
+            controller.abort(error);
+            const terminalDrain = Promise.all([
+                operationPromise.then(() => undefined, () => undefined),
+                Promise.resolve()
+                    .then(() => options.terminalDrain?.())
+                    .then((disposition) => disposition ?? "retryable", () => "retryable"),
+            ]).then(([, disposition]) => disposition);
+            this.#rememberTerminalAcceptance(messageKey, error, terminalDrain);
+        };
+        const abortFromOwner = () => {
+            const reason = options.signal?.reason;
+            fenceTerminalAcceptance(reason instanceof Error ? reason : new Error("WhatsApp message acceptance cancelled."));
+        };
+        if (options.signal?.aborted) {
+            abortFromOwner();
+        }
+        else {
+            options.signal?.addEventListener("abort", abortFromOwner, { once: true });
+        }
+        const timeout = setTimeout(() => {
+            const error = new Error("WhatsApp message acceptance timed out.");
+            fenceTerminalAcceptance(error);
+            try {
+                options.onTerminalTimeout?.();
+            }
+            catch { }
+        }, timeoutMs);
+        timeout.unref();
+        let pendingAcknowledgement;
+        const acceptance = Promise.resolve().then(async () => {
+            try {
+                const accepted = await awaitWithAbort(operationPromise, controller.signal);
+                if (!accepted) {
+                    if (this.#pendingAcknowledgements.get(messageKey) === pendingAcknowledgement) {
+                        this.#pendingAcknowledgements.delete(messageKey);
+                    }
+                    return false;
+                }
+                if (pendingAcknowledgement.acknowledged) {
+                    if (this.#pendingAcknowledgements.get(messageKey) === pendingAcknowledgement) {
+                        this.#pendingAcknowledgements.delete(messageKey);
+                    }
+                    this.#rememberAcknowledgedMessage(messageKey);
+                }
+                else {
+                    pendingAcknowledgement.acceptedAt = this.now();
+                }
+                return true;
+            }
+            catch (error) {
+                if (this.#pendingAcknowledgements.get(messageKey) === pendingAcknowledgement) {
+                    this.#pendingAcknowledgements.delete(messageKey);
+                }
+                throw error;
+            }
+            finally {
+                clearTimeout(timeout);
+                options.signal?.removeEventListener("abort", abortFromOwner);
+            }
+        });
+        pendingAcknowledgement = {
+            acceptance,
+            acceptedAt: undefined,
+            acknowledged: false,
+        };
+        this.#pendingAcknowledgements.set(messageKey, pendingAcknowledgement);
+        return await acceptance;
+    }
+    markMessageAcknowledged(peerJid, messageId) {
+        const peer = canonicalizeWhatsAppChatCorrelationJid(peerJid);
+        if (peer && messageId) {
+            const messageKey = `${peer}\0${messageId}`;
+            this.#recoverExpiredPendingAcknowledgements();
+            const pendingAcknowledgement = this.#pendingAcknowledgements.get(messageKey);
+            if (!pendingAcknowledgement) {
+                return;
+            }
+            if (pendingAcknowledgement.acceptedAt === undefined) {
+                pendingAcknowledgement.acknowledged = true;
+                return;
+            }
+            this.#pendingAcknowledgements.delete(messageKey);
+            this.#rememberAcknowledgedMessage(messageKey);
+        }
+    }
+    hasPersistedMessage(messageKey) {
+        return this.#persistedMessageIds.has(messageKey);
+    }
+    clearPersistedMessage(messageKey) {
+        this.#persistedMessageIds.delete(messageKey);
+        this.releaseMessagePreKeyProtection(messageKey);
+    }
+    releaseMessagePreKeyProtection(messageKey) {
+        const protections = this.#messagePreKeyProtections.get(messageKey);
+        if (!protections) {
+            return;
+        }
+        this.#messagePreKeyProtections.delete(messageKey);
+        for (const [identityKey, preKeyIds] of protections) {
+            const bundle = this.#bundles.get(identityKey);
+            if (!bundle) {
+                continue;
+            }
+            for (const preKeyId of preKeyIds) {
+                const references = bundle.protectedPreKeyIds.get(preKeyId) ?? 0;
+                if (references <= 1) {
+                    bundle.protectedPreKeyIds.delete(preKeyId);
+                }
+                else {
+                    bundle.protectedPreKeyIds.set(preKeyId, references - 1);
+                }
+            }
+        }
+    }
+    associateLid(phoneNumberJid, lidJid) {
+        const phoneNumber = canonicalizeWhatsAppUserCorrelationJid(phoneNumberJid);
+        const lid = canonicalizeWhatsAppUserCorrelationJid(lidJid);
+        if (!phoneNumber?.endsWith("@s.whatsapp.net") || !lid?.endsWith("@lid")) {
+            throw new Error("Invalid WhatsApp PN/LID signal mapping.");
+        }
+        const phoneNumberKey = signalBundleIdentityKey(phoneNumber);
+        this.#lidByPhoneNumber.delete(phoneNumberKey);
+        this.#lidByPhoneNumber.set(phoneNumberKey, signalBundleIdentityKey(lid));
+        if (this.#lidByPhoneNumber.size > this.maxBundles) {
+            const oldestPhoneNumber = this.#lidByPhoneNumber.keys().next().value;
+            if (oldestPhoneNumber !== undefined) {
+                this.#lidByPhoneNumber.delete(oldestPhoneNumber);
+            }
+        }
+    }
+    resolveAssociatedLid(phoneNumberJid) {
+        const phoneNumber = canonicalizeWhatsAppUserCorrelationJid(phoneNumberJid);
+        if (!phoneNumber?.endsWith("@s.whatsapp.net")) {
+            return undefined;
+        }
+        return this.#lidByPhoneNumber.get(signalBundleIdentityKey(phoneNumber));
+    }
+    resolveMany(jids) {
+        const uniqueNewIdentities = new Set();
+        const identityKeys = [];
+        for (const jid of jids) {
+            const canonical = canonicalizeWhatsAppUserCorrelationJid(jid);
+            if (!canonical) {
+                throw new Error(`Invalid WhatsApp signal bundle JID: ${jid}.`);
+            }
+            const identityKey = signalBundleIdentityKey(canonical);
+            identityKeys.push(identityKey);
+            if (!this.#bundles.has(identityKey)) {
+                uniqueNewIdentities.add(identityKey);
+            }
+        }
+        if (this.#bundles.size + uniqueNewIdentities.size > this.maxBundles) {
+            // Published bundle identities stay stable for the store lifetime.
+            throw new Error(`WhatsApp signal bundle limit exceeded (${this.maxBundles}).`);
+        }
+        const stagedNewBundles = new Map();
+        const stagedReservations = new Map();
+        const reservationNow = this.now();
+        const stagedForIdentity = (identityKey) => {
+            let bundle = this.#bundles.get(identityKey) ?? stagedNewBundles.get(identityKey);
+            if (!bundle) {
+                bundle = this.#createBundle();
+                stagedNewBundles.set(identityKey, bundle);
+            }
+            let staged = stagedReservations.get(identityKey);
+            if (!staged) {
+                const preKeys = new Map(bundle.preKeys);
+                const preKeyReservations = new Map(bundle.preKeyReservations);
+                for (const [preKeyId, reservedAt] of preKeyReservations) {
+                    if (reservationNow - reservedAt >= this.#preKeyReservationTtlMs &&
+                        !bundle.protectedPreKeyIds.has(preKeyId)) {
+                        preKeyReservations.delete(preKeyId);
+                        preKeys.delete(preKeyId);
+                    }
+                }
+                staged = {
+                    availablePreKeyIds: bundle.availablePreKeyIds.filter((id) => preKeys.has(id)),
+                    bundle,
+                    nextPreKeyId: bundle.nextPreKeyId,
+                    preKeyReservations,
+                    preKeys,
+                };
+                stagedReservations.set(identityKey, staged);
+            }
+            return staged;
+        };
+        const requestedPreKeys = new Map();
+        for (const identityKey of identityKeys) {
+            requestedPreKeys.set(identityKey, (requestedPreKeys.get(identityKey) ?? 0) + 1);
+        }
+        for (const [identityKey, requested] of requestedPreKeys) {
+            const staged = stagedForIdentity(identityKey);
+            const available = staged.availablePreKeyIds.length;
+            const creatable = Math.max(0, this.#maxPreKeysPerBundle - staged.preKeys.size - staged.bundle.pendingPreKeyIds.size);
+            if (requested > available + creatable) {
+                throw new Error(`WhatsApp Signal prekey reservation limit exceeded (${this.#maxPreKeysPerBundle}).`);
+            }
+        }
+        const reservedBundles = identityKeys.map((identityKey) => {
+            const staged = stagedForIdentity(identityKey);
+            const { bundle } = staged;
+            let preKeyId = staged.availablePreKeyIds.shift();
+            if (preKeyId === undefined) {
+                const created = this.#createPreKey(staged.preKeys, staged.nextPreKeyId, staged.bundle.pendingPreKeyIds);
+                preKeyId = created.id;
+                staged.preKeys.set(created.id, created.keyPair);
+                staged.nextPreKeyId = created.nextPreKeyId;
+            }
+            const preKey = staged.preKeys.get(preKeyId);
+            if (!preKey) {
+                throw new Error("WhatsApp Signal prekey reservation is unavailable.");
+            }
+            staged.preKeyReservations.set(preKeyId, reservationNow);
+            return {
+                identityKey: bundle.identityKey,
+                preKey,
+                preKeyId,
+                registrationId: bundle.registrationId,
+                signedPreKey: bundle.signedPreKey,
+            };
+        });
+        for (const [identityKey, bundle] of stagedNewBundles) {
+            this.#bundles.set(identityKey, bundle);
+        }
+        for (const staged of stagedReservations.values()) {
+            staged.bundle.availablePreKeyIds = staged.availablePreKeyIds;
+            staged.bundle.nextPreKeyId = staged.nextPreKeyId;
+            staged.bundle.preKeyReservations = staged.preKeyReservations;
+            staged.bundle.preKeys = staged.preKeys;
+        }
+        return reservedBundles;
+    }
+    async decryptDirectMessage(params) {
+        const result = await this.transactDirectMessage({
+            ...params,
+            accept: async (plaintext) => plaintext,
+        });
+        if (result.status === "decrypt-failed") {
+            throw result.error;
+        }
+        return result.status === "accepted" ? result.value : undefined;
+    }
+    async transactDirectMessage(params) {
+        params.signal?.throwIfAborted();
+        const recipientJid = canonicalizeWhatsAppUserCorrelationJid(params.recipientJid);
+        const recipientIdentityKey = recipientJid ? signalBundleIdentityKey(recipientJid) : undefined;
+        const mappedLidIdentityKey = recipientIdentityKey
+            ? this.resolveAssociatedLid(recipientIdentityKey)
+            : undefined;
+        const identityKey = mappedLidIdentityKey && this.#bundles.has(mappedLidIdentityKey)
+            ? mappedLidIdentityKey
+            : recipientIdentityKey;
+        const bundle = identityKey ? this.#bundles.get(identityKey) : undefined;
+        if (!identityKey || !bundle) {
+            return { status: "unavailable" };
+        }
+        const remoteAddress = signalProtocolAddress(params.remoteJid);
+        if (!remoteAddress) {
+            return { status: "unavailable" };
+        }
+        const address = new ProtocolAddress(remoteAddress.name, remoteAddress.deviceId);
+        // Capacity checks, staged writes, and commits stay atomic per recipient bundle.
+        return await this.#runTransaction(identityKey, async () => {
+            params.signal?.throwIfAborted();
+            const sessions = this.#sessions.get(identityKey) ?? new Map();
+            const sessionLimitError = new Error("WhatsApp Signal session limit exceeded.");
+            const maxSessionsPerBundle = this.#maxSessionsPerBundle;
+            let stagedNewSessionCount = 0;
+            const stagedPreKeyRemovals = new Set();
+            const stagedSessions = new Map();
+            const storage = {
+                async loadSession(id) {
+                    const session = stagedSessions.get(id) ?? sessions.get(id);
+                    return session ? cloneSignalSession(session) : undefined;
+                },
+                async storeSession(id, session) {
+                    if (!sessions.has(id) && !stagedSessions.has(id)) {
+                        if (sessions.size + stagedNewSessionCount >= maxSessionsPerBundle) {
+                            throw sessionLimitError;
+                        }
+                        stagedNewSessionCount += 1;
+                    }
+                    stagedSessions.set(id, cloneSignalSession(session));
+                },
+                isTrustedIdentity: () => true,
+                loadPreKey: async (id) => {
+                    const preKey = bundle.preKeys.get(Number(id));
+                    if (preKey && params.messageKey) {
+                        this.#protectMessagePreKey(params.messageKey, identityKey, Number(id));
+                    }
+                    return preKey ? signalKeyPair(preKey) : undefined;
+                },
+                removePreKey(id) {
+                    stagedPreKeyRemovals.add(id);
+                },
+                loadSignedPreKey: () => signalKeyPair(bundle.signedPreKey.keyPair),
+                getOurRegistrationId: () => bundle.registrationId,
+                getOurIdentity: () => signalKeyPair(bundle.identityKey),
+            };
+            const cipher = new SessionCipher(storage, address);
+            let plaintext;
+            try {
+                plaintext =
+                    params.type === "pkmsg"
+                        ? await cipher.decryptPreKeyWhisperMessage(params.ciphertext)
+                        : await cipher.decryptWhisperMessage(params.ciphertext);
+            }
+            catch (error) {
+                if (error === sessionLimitError) {
+                    return { status: "rejected" };
+                }
+                return { error, status: "decrypt-failed" };
+            }
+            params.signal?.throwIfAborted();
+            let stagedNextPreKeyId = bundle.nextPreKeyId;
+            const stagedPreKeyIds = new Set();
+            const replacementPreKeys = [...stagedPreKeyRemovals]
+                .filter((id) => bundle.preKeys.has(id))
+                .map(() => {
+                const unavailableIds = new Set([...bundle.pendingPreKeyIds, ...stagedPreKeyIds]);
+                const created = this.#createPreKey(bundle.preKeys, stagedNextPreKeyId, unavailableIds);
+                stagedNextPreKeyId = created.nextPreKeyId;
+                stagedPreKeyIds.add(created.id);
+                return created;
+            });
+            for (const replacementPreKey of replacementPreKeys) {
+                bundle.pendingPreKeyIds.add(replacementPreKey.id);
+            }
+            bundle.nextPreKeyId = stagedNextPreKeyId;
+            try {
+                const accepted = await awaitWithAbort(Promise.resolve().then(() => params.accept(plaintext)), params.signal);
+                if (accepted === undefined) {
+                    return { status: "rejected" };
+                }
+                params.signal?.throwIfAborted();
+                for (const [id, session] of stagedSessions) {
+                    sessions.set(id, session);
+                }
+                if (stagedSessions.size > 0) {
+                    this.#sessions.set(identityKey, sessions);
+                }
+                for (const id of stagedPreKeyRemovals) {
+                    bundle.preKeyReservations.delete(id);
+                    bundle.preKeys.delete(id);
+                }
+                for (const replacementPreKey of replacementPreKeys) {
+                    bundle.preKeys.set(replacementPreKey.id, replacementPreKey.keyPair);
+                    bundle.availablePreKeyIds.push(replacementPreKey.id);
+                }
+                return { status: "accepted", value: accepted };
+            }
+            finally {
+                for (const replacementPreKey of replacementPreKeys) {
+                    bundle.pendingPreKeyIds.delete(replacementPreKey.id);
+                }
+            }
+        });
+    }
+    #createBundle() {
+        const identityKey = generateSignalKeyPair();
+        return {
+            availablePreKeyIds: [],
+            identityKey,
+            nextPreKeyId: 1,
+            pendingPreKeyIds: new Set(),
+            preKeyReservations: new Map(),
+            preKeys: new Map(),
+            protectedPreKeyIds: new Map(),
+            registrationId: 1,
+            signedPreKey: signedKeyPair(identityKey, 1),
+        };
+    }
+    #createPreKey(preKeys, startingId, stagedIds = new Set()) {
+        let id = startingId;
+        while (preKeys.has(id) || stagedIds.has(id)) {
+            id = id === 0xff_ff_ff ? 1 : id + 1;
+            if (id === startingId) {
+                throw new Error("WhatsApp Signal prekey identifier space exhausted.");
+            }
+        }
+        return {
+            id,
+            keyPair: generateSignalKeyPair(),
+            nextPreKeyId: id === 0xff_ff_ff ? 1 : id + 1,
+        };
+    }
+    #recoverExpiredPendingAcknowledgements() {
+        const now = this.now();
+        for (const [messageKey, pendingAcknowledgement] of this.#pendingAcknowledgements) {
+            const { acceptedAt } = pendingAcknowledgement;
+            if (acceptedAt === undefined) {
+                continue;
+            }
+            if (now - acceptedAt < this.maxPendingAcknowledgementAgeMs) {
+                continue;
+            }
+            this.#pendingAcknowledgements.delete(messageKey);
+            this.#rememberAcknowledgedMessage(messageKey);
+        }
+    }
+    #rememberAcknowledgedMessage(messageKey) {
+        this.#acknowledgedMessageIds.delete(messageKey);
+        this.#acknowledgedMessageIds.set(messageKey, true);
+        if (this.#acknowledgedMessageIds.size > this.maxRecentAcknowledgements) {
+            const oldestMessageKey = this.#acknowledgedMessageIds.keys().next().value;
+            if (oldestMessageKey !== undefined) {
+                this.#acknowledgedMessageIds.delete(oldestMessageKey);
+            }
+        }
+    }
+    #rememberPersistedMessage(messageKey) {
+        this.#persistedMessageIds.delete(messageKey);
+        this.#persistedMessageIds.set(messageKey, true);
+        if (this.#persistedMessageIds.size > this.maxRecentAcknowledgements) {
+            const oldestMessageKey = this.#persistedMessageIds.keys().next().value;
+            if (oldestMessageKey !== undefined) {
+                this.#persistedMessageIds.delete(oldestMessageKey);
+                this.releaseMessagePreKeyProtection(oldestMessageKey);
+            }
+        }
+    }
+    #protectMessagePreKey(messageKey, identityKey, preKeyId) {
+        let protections = this.#messagePreKeyProtections.get(messageKey);
+        if (!protections) {
+            protections = new Map();
+            this.#messagePreKeyProtections.set(messageKey, protections);
+        }
+        let preKeyIds = protections.get(identityKey);
+        if (!preKeyIds) {
+            preKeyIds = new Set();
+            protections.set(identityKey, preKeyIds);
+        }
+        if (preKeyIds.has(preKeyId)) {
+            return;
+        }
+        preKeyIds.add(preKeyId);
+        const bundle = this.#bundles.get(identityKey);
+        if (bundle) {
+            bundle.protectedPreKeyIds.set(preKeyId, (bundle.protectedPreKeyIds.get(preKeyId) ?? 0) + 1);
+        }
+    }
+    #rememberTerminalAcceptance(messageKey, error, drain) {
+        const terminalAcceptance = { error };
+        this.#terminalAcceptances.set(messageKey, terminalAcceptance);
+        void drain.then((disposition) => {
+            if (this.#terminalAcceptances.get(messageKey) === terminalAcceptance) {
+                this.#terminalAcceptances.delete(messageKey);
+            }
+            if (disposition === "acknowledged") {
+                this.#rememberAcknowledgedMessage(messageKey);
+            }
+            else if (disposition === "persisted") {
+                this.#rememberPersistedMessage(messageKey);
+            }
+        });
+    }
+    async #runTransaction(key, operation) {
+        return await this.#runSerialized(this.#pendingTransactions, key, operation);
+    }
+    async #runSerialized(pending, key, operation) {
+        const previous = pending.get(key) ?? Promise.resolve();
+        const result = previous.catch(() => undefined).then(operation);
+        const settled = result.then(() => undefined, () => undefined);
+        pending.set(key, settled);
+        try {
+            return await result;
+        }
+        finally {
+            if (pending.get(key) === settled) {
+                pending.delete(key);
+            }
+        }
+    }
+}
+export function createSerializedMessageHandler(processMessage, onError, options = {}) {
+    const maxPendingBytes = options.maxPendingBytes ?? MAX_PENDING_WEBSOCKET_BYTES;
+    const maxPendingMessages = options.maxPendingMessages ?? MAX_PENDING_WEBSOCKET_MESSAGES;
+    const sizeOf = options.sizeOf ?? (() => 1);
+    let failed = false;
+    let pendingBytes = 0;
+    let pendingMessages = 0;
+    let pending = Promise.resolve();
+    const fail = (error) => {
+        if (!failed) {
+            failed = true;
+            onError(error);
+        }
+    };
+    return (message) => {
+        if (failed) {
+            return pending;
+        }
+        const messageBytes = sizeOf(message);
+        if (!Number.isSafeInteger(messageBytes) || messageBytes < 0) {
+            fail(new Error("WhatsApp WebSocket message size must be a non-negative safe integer."));
+            return pending;
+        }
+        if (pendingMessages >= maxPendingMessages || pendingBytes + messageBytes > maxPendingBytes) {
+            fail(new Error("WhatsApp WebSocket inbound backlog limit exceeded."));
+            return pending;
+        }
+        pendingMessages += 1;
+        pendingBytes += messageBytes;
+        const next = pending
+            .then(async () => {
+            if (!failed) {
+                await processMessage(message);
+            }
+        })
+            .finally(() => {
+            pendingMessages -= 1;
+            pendingBytes -= messageBytes;
+        });
+        pending = next.catch((error) => {
+            fail(error);
+        });
+        return pending;
+    };
+}
+export class WhatsAppNoiseFrameDecoder {
+    #bufferedBytes = 0;
+    #chunks = [];
+    #expectIntro = true;
+    #offset = 0;
+    get bufferedBytes() {
+        return this.#bufferedBytes;
+    }
+    decodeFrames(data) {
+        let chunk = rawDataToBuffer(data);
+        if (this.#expectIntro) {
+            chunk = removeNoiseIntroHeader(chunk);
+            this.#expectIntro = false;
+        }
+        if (chunk.length > 0) {
+            if (this.#chunks.length >= MAX_WHATSAPP_NOISE_BUFFER_CHUNKS) {
+                throw new Error(`WhatsApp Noise buffer exceeds ${MAX_WHATSAPP_NOISE_BUFFER_CHUNKS} chunks.`);
+            }
+            this.#chunks.push(chunk);
+            this.#bufferedBytes += chunk.length;
+        }
+        const frames = [];
+        while (this.#bufferedBytes >= 3) {
+            const size = (this.#peekByte(0) << 16) | (this.#peekByte(1) << 8) | this.#peekByte(2);
+            if (size > MAX_WHATSAPP_NOISE_FRAME_BYTES) {
+                throw new Error(`WhatsApp Noise frame exceeds ${MAX_WHATSAPP_NOISE_FRAME_BYTES} bytes.`);
+            }
+            if (this.#bufferedBytes < size + 3) {
+                break;
+            }
+            if (frames.length >= MAX_WHATSAPP_NOISE_FRAMES_PER_MESSAGE) {
+                throw new Error(`WhatsApp Noise message exceeds ${MAX_WHATSAPP_NOISE_FRAMES_PER_MESSAGE} frames.`);
+            }
+            this.#consume(3);
+            frames.push(this.#read(size));
+        }
+        return frames;
+    }
+    #consume(length) {
+        let remaining = length;
+        while (remaining > 0) {
+            const chunk = this.#chunks[0];
+            if (!chunk) {
+                throw new Error("Unexpected end of WhatsApp Noise frame buffer.");
+            }
+            const available = chunk.length - this.#offset;
+            const consumed = Math.min(available, remaining);
+            this.#offset += consumed;
+            this.#bufferedBytes -= consumed;
+            remaining -= consumed;
+            if (this.#offset === chunk.length) {
+                this.#chunks.shift();
+                this.#offset = 0;
+            }
+        }
+    }
+    #peekByte(index) {
+        let remaining = index + this.#offset;
+        for (const chunk of this.#chunks) {
+            if (remaining < chunk.length) {
+                return chunk[remaining];
+            }
+            remaining -= chunk.length;
+        }
+        throw new Error("Unexpected end of WhatsApp Noise frame buffer.");
+    }
+    #read(length) {
+        const result = Buffer.allocUnsafe(length);
+        let resultOffset = 0;
+        while (resultOffset < length) {
+            const chunk = this.#chunks[0];
+            if (!chunk) {
+                throw new Error("Unexpected end of WhatsApp Noise frame buffer.");
+            }
+            const copied = chunk.copy(result, resultOffset, this.#offset, Math.min(chunk.length, this.#offset + length - resultOffset));
+            this.#offset += copied;
+            this.#bufferedBytes -= copied;
+            resultOffset += copied;
+            if (this.#offset === chunk.length) {
+                this.#chunks.shift();
+                this.#offset = 0;
+            }
+        }
+        return result;
+    }
+}
+class TransportState {
+    encKey;
+    decKey;
+    #readCounter = 0;
+    #writeCounter = 0;
+    constructor(encKey, decKey) {
+        this.encKey = encKey;
+        this.decKey = decKey;
+    }
+    decrypt(ciphertext) {
+        const iv = createIv(this.#readCounter++);
+        return aesDecryptGCM(Buffer.from(ciphertext), this.decKey, iv, EMPTY_BUFFER);
+    }
+    encrypt(plaintext) {
+        const iv = createIv(this.#writeCounter++);
+        return aesEncryptGCM(Buffer.from(plaintext), this.encKey, iv, EMPTY_BUFFER);
+    }
+}
+class BaileysNoiseServer {
+    #counter = 0;
+    #decKey;
+    #encKey;
+    #frames = new WhatsAppNoiseFrameDecoder();
+    #hash;
+    #salt;
+    #serverEphemeralKey;
+    #serverStaticKey;
+    #transport;
+    constructor() {
+        const initial = Buffer.from(NOISE_MODE);
+        this.#hash = Buffer.from(initial.byteLength === 32 ? initial : sha256(initial));
+        this.#salt = this.#hash;
+        this.#encKey = this.#hash;
+        this.#decKey = this.#hash;
+        this.#authenticate(NOISE_WA_HEADER);
+    }
+    decodeFrames(data) {
+        return this.#frames.decodeFrames(data);
+    }
+    async decodeTransportNode(frame) {
+        if (!this.#transport) {
+            throw new Error("Cannot decode a Baileys node before the Noise transport is ready.");
+        }
+        return await decodeBinaryNode(this.#transport.decrypt(frame));
+    }
+    finishClientHandshake(frame) {
+        const message = decodeHandshakeMessage(frame);
+        const finish = message.clientFinish;
+        if (!finish?.staticKey || !finish.payload || !this.#serverEphemeralKey) {
+            throw new Error("Invalid Baileys client finish handshake.");
+        }
+        const clientNoisePublic = this.#decrypt(finish.staticKey);
+        this.#mixIntoKey(Curve.sharedKey(this.#serverEphemeralKey.private, clientNoisePublic));
+        this.#decrypt(finish.payload);
+        const [writeKey, readKey] = this.#localHKDF(EMPTY_BUFFER);
+        this.#transport = new TransportState(readKey, writeKey);
+    }
+    createServerHello(frame) {
+        const message = decodeHandshakeMessage(frame);
+        const clientHello = message.clientHello;
+        if (!clientHello?.ephemeral) {
+            throw new Error("Invalid Baileys client hello handshake.");
+        }
+        this.#authenticate(clientHello.ephemeral);
+        this.#serverEphemeralKey = Curve.generateKeyPair();
+        this.#serverStaticKey = Curve.generateKeyPair();
+        this.#authenticate(this.#serverEphemeralKey.public);
+        this.#mixIntoKey(Curve.sharedKey(this.#serverEphemeralKey.private, clientHello.ephemeral));
+        const staticKey = this.#encrypt(this.#serverStaticKey.public);
+        this.#mixIntoKey(Curve.sharedKey(this.#serverStaticKey.private, clientHello.ephemeral));
+        const payload = this.#encrypt(WHATSAPP_NOISE_CERT_CHAIN);
+        return encodeLengthPrefixed(encodeHandshakeMessage({
+            serverHello: {
+                ephemeral: this.#serverEphemeralKey.public,
+                payload,
+                staticKey,
+            },
+        }));
+    }
+    encodeNode(node) {
+        if (!this.#transport) {
+            throw new Error("Cannot encode a Baileys node before the Noise transport is ready.");
+        }
+        return encodeLengthPrefixed(this.#transport.encrypt(encodeBinaryNode(node)));
+    }
+    #authenticate(data) {
+        this.#hash = sha256(Buffer.concat([this.#hash, Buffer.from(data)]));
+    }
+    #decrypt(ciphertext) {
+        const result = aesDecryptGCM(Buffer.from(ciphertext), this.#decKey, createIv(this.#counter++), this.#hash);
+        this.#authenticate(ciphertext);
+        return result;
+    }
+    #encrypt(plaintext) {
+        const result = aesEncryptGCM(Buffer.from(plaintext), this.#encKey, createIv(this.#counter++), this.#hash);
+        this.#authenticate(result);
+        return result;
+    }
+    #localHKDF(data) {
+        const key = hkdf(Buffer.from(data), 64, { info: "", salt: this.#salt });
+        return [Buffer.from(key.subarray(0, 32)), Buffer.from(key.subarray(32))];
+    }
+    #mixIntoKey(data) {
+        const [writeKey, readKey] = this.#localHKDF(data);
+        this.#salt = writeKey;
+        this.#encKey = readKey;
+        this.#decKey = readKey;
+        this.#counter = 0;
+    }
+}
+class WhatsAppBaileysWebSocketSession {
+    socket;
+    params;
+    #acceptanceAbort = new AbortController();
+    #handshakeState = "client-hello";
+    #handleSerializedMessage;
+    #noise = new BaileysNoiseServer();
+    constructor(socket, params) {
+        this.socket = socket;
+        this.params = params;
+        this.#handleSerializedMessage = createSerializedMessageHandler((data) => this.#handleMessage(data), (error) => {
+            const close = resolveWhatsAppWebSocketClose(error);
+            this.socket.close(close.code, close.reason);
+        }, {
+            sizeOf: rawDataByteLength,
+        });
+    }
+    get isOpen() {
+        return this.#handshakeState === "open" && this.socket.readyState === WebSocket.OPEN;
+    }
+    handleMessage(data) {
+        return this.#handleSerializedMessage(data);
+    }
+    abortAcceptance(reason) {
+        if (!this.#acceptanceAbort.signal.aborted) {
+            this.#acceptanceAbort.abort(reason);
+        }
+    }
+    async deliverInboundMessage(message) {
+        if (!this.isOpen) {
+            return false;
+        }
+        try {
+            await this.#sendNode(createInboundMessageNode(message));
+            return true;
+        }
+        catch {
+            this.socket.terminate();
+            return false;
+        }
+    }
+    async #handleMessage(data) {
+        for (const frame of this.#noise.decodeFrames(data)) {
+            if (this.#handshakeState === "client-hello") {
+                await sendWhatsAppWebSocketPayload(this.socket, this.#noise.createServerHello(frame));
+                this.#handshakeState = "client-finish";
+                continue;
+            }
+            if (this.#handshakeState === "client-finish") {
+                this.#noise.finishClientHandshake(frame);
+                this.#handshakeState = "open";
+                await this.#sendNode({
+                    attrs: {
+                        lid: lidForJid(this.params.selfJid),
+                        t: unixSeconds(),
+                    },
+                    tag: "success",
+                });
+                await this.#sendNode({
+                    attrs: {},
+                    content: [{ attrs: { count: "0" }, tag: "offline" }],
+                    tag: "ib",
+                });
+                this.params.onOpen(this);
+                continue;
+            }
+            await this.#handleNode(await this.#noise.decodeTransportNode(frame));
+        }
+    }
+    async #handleNode(node) {
+        await awaitWithAbort(this.#recordNode(node), this.#acceptanceAbort.signal);
+        if (node.tag === "iq") {
+            await this.#sendNode(this.#createIqResult(node));
+            return;
+        }
+        if (node.tag === "message") {
+            const peer = requireAttr(node, "to");
+            const messageId = requireAttr(node, "id");
+            const accepted = await persistAcceptedBaileysMessage({
+                acceptanceSignal: this.#acceptanceAbort.signal,
+                appendEvent: this.params.appendEvent,
+                node,
+                onAcceptanceTimeout: () => {
+                    const close = resolveWhatsAppWebSocketClose(new Error("WhatsApp message acceptance timed out."));
+                    this.socket.close(close.code, close.reason);
+                },
+                path: this.params.path,
+                remoteJid: this.params.selfJid,
+                signalBundles: this.params.signalBundles,
+            });
+            if (!accepted) {
+                return;
+            }
+            await this.#sendNode({
+                attrs: {
+                    class: "message",
+                    from: peer,
+                    id: messageId,
+                    to: this.params.selfJid,
+                    ...(node.attrs.type ? { type: node.attrs.type } : {}),
+                },
+                tag: "ack",
+            });
+            this.params.signalBundles.markMessageAcknowledged(peer, messageId);
+        }
+    }
+    #createIqResult(node) {
+        const child = firstChild(node);
+        const id = requireAttr(node, "id");
+        const attrs = {
+            from: node.attrs.to ?? S_WHATSAPP_NET,
+            id,
+            t: unixSeconds(),
+            type: "result",
+        };
+        if (node.attrs.xmlns === "encrypt" && child?.tag === "count") {
+            return { attrs, content: [{ attrs: { value: "50" }, tag: "count" }], tag: "iq" };
+        }
+        if (node.attrs.xmlns === "encrypt" && child?.tag === "digest") {
+            return { attrs, content: [{ attrs: {}, tag: "digest" }], tag: "iq" };
+        }
+        if (node.attrs.xmlns === "encrypt" && child?.tag === "key") {
+            try {
+                return { attrs, content: [this.#createKeyList(child)], tag: "iq" };
+            }
+            catch (error) {
+                return {
+                    attrs: { ...attrs, type: "error" },
+                    content: [
+                        {
+                            attrs: {
+                                code: "400",
+                                text: error instanceof Error ? error.message : String(error),
+                                type: "modify",
+                            },
+                            tag: "error",
+                        },
+                    ],
+                    tag: "iq",
+                };
+            }
+        }
+        if (node.attrs.xmlns === "usync" && child?.tag === "usync") {
+            return { attrs, content: [this.#createUSyncResult(child)], tag: "iq" };
+        }
+        if (node.attrs.xmlns === "abt") {
+            return {
+                attrs,
+                content: [
+                    {
+                        attrs: { hash: "mock" },
+                        content: [
+                            { attrs: { name: "10518", value: "false" }, tag: "prop" },
+                            { attrs: { name: "14303", value: "false" }, tag: "prop" },
+                        ],
+                        tag: "props",
+                    },
+                ],
+                tag: "iq",
+            };
+        }
+        if (node.attrs.xmlns === "blocklist") {
+            return { attrs, content: [{ attrs: {}, content: [], tag: "list" }], tag: "iq" };
+        }
+        if (node.attrs.xmlns === "privacy") {
+            return {
+                attrs,
+                content: [
+                    {
+                        attrs: {},
+                        content: [
+                            { attrs: { name: "readreceipts", value: "all" }, tag: "category" },
+                            { attrs: { name: "profile", value: "all" }, tag: "category" },
+                        ],
+                        tag: "privacy",
+                    },
+                ],
+                tag: "iq",
+            };
+        }
+        if (node.attrs.xmlns === "w:m" && child?.tag === "media_conn") {
+            return {
+                attrs,
+                content: [
+                    {
+                        attrs: { auth: "mock", ttl: "3600" },
+                        content: [
+                            {
+                                attrs: {
+                                    hostname: "127.0.0.1",
+                                    maxContentLengthBytes: "10485760",
+                                },
+                                tag: "host",
+                            },
+                        ],
+                        tag: "media_conn",
+                    },
+                ],
+                tag: "iq",
+            };
+        }
+        if (node.attrs.xmlns === "w:g2") {
+            if (node.attrs.type === "get" && child?.tag === "participating") {
+                return {
+                    attrs,
+                    content: [{ attrs: {}, content: [], tag: "groups" }],
+                    tag: "iq",
+                };
+            }
+            if (node.attrs.type !== "get" || child?.tag !== "query") {
+                return {
+                    attrs: { ...attrs, type: "error" },
+                    content: [
+                        {
+                            attrs: { code: "501", text: "unsupported group operation", type: "cancel" },
+                            tag: "error",
+                        },
+                    ],
+                    tag: "iq",
+                };
+            }
+            return {
+                attrs,
+                content: [
+                    {
+                        attrs: {
+                            id: node.attrs.to ?? "120363000000000000@g.us",
+                            owner: this.params.selfJid,
+                            subject: "Test Group",
+                            s_t: unixSeconds(),
+                        },
+                        content: [{ attrs: { jid: this.params.selfJid }, tag: "participant" }],
+                        tag: "group",
+                    },
+                ],
+                tag: "iq",
+            };
+        }
+        return { attrs, tag: "iq" };
+    }
+    #createKeyList(keyNode) {
+        const users = children(keyNode).filter((child) => child.tag === "user");
+        const jids = users.map((userNode) => requireAttr(userNode, "jid"));
+        const bundles = this.params.signalBundles.resolveMany(jids);
+        return {
+            attrs: {},
+            content: jids.map((jid, index) => this.#createKeyUser(jid, bundles[index])),
+            tag: "list",
+        };
+    }
+    #createKeyUser(jid, bundle) {
+        return {
+            attrs: { jid },
+            content: [
+                { attrs: {}, content: encodeBigEndian(bundle.registrationId), tag: "registration" },
+                { attrs: {}, content: KEY_BUNDLE_TYPE, tag: "type" },
+                {
+                    attrs: {},
+                    content: scrubSignalPublicKey(bundle.identityKey.public),
+                    tag: "identity",
+                },
+                xmppSignedPreKey(bundle.signedPreKey),
+                xmppPreKey(bundle.preKey, bundle.preKeyId),
+            ],
+            tag: "user",
+        };
+    }
+    #createUSyncResult(usyncNode) {
+        const requestList = children(usyncNode).find((child) => child.tag === "list");
+        const requestedUsers = requestList
+            ? children(requestList).filter((child) => child.tag === "user")
+            : [];
+        return {
+            attrs: {
+                index: usyncNode.attrs.index ?? "0",
+                last: "true",
+                sid: usyncNode.attrs.sid ?? "mock",
+            },
+            content: [
+                {
+                    attrs: {},
+                    content: requestedUsers.map((user) => this.#createUSyncUser(requireAttr(user, "jid"))),
+                    tag: "list",
+                },
+            ],
+            tag: "usync",
+        };
+    }
+    #createUSyncUser(jid) {
+        const lid = lidForJid(jid);
+        if (canonicalizeWhatsAppUserCorrelationJid(jid)?.endsWith("@s.whatsapp.net")) {
+            this.params.signalBundles.associateLid(jid, lid);
+        }
+        return {
+            attrs: { jid },
+            content: [
+                {
+                    attrs: {},
+                    content: [
+                        {
+                            attrs: {},
+                            content: [{ attrs: { id: "0" }, tag: "device" }],
+                            tag: "device-list",
+                        },
+                    ],
+                    tag: "devices",
+                },
+                { attrs: { val: lid }, tag: "lid" },
+            ],
+            tag: "user",
+        };
+    }
+    async #recordNode(node) {
+        await this.params.appendEvent({
+            at: new Date().toISOString(),
+            body: sanitizeNodeForJson(node),
+            method: "WEBSOCKET",
+            path: this.params.path,
+            query: {},
+            type: "api",
+        });
+    }
+    async #sendNode(node) {
+        await sendWhatsAppWebSocketPayload(this.socket, this.#noise.encodeNode(node));
+    }
+}
+export async function sendWhatsAppWebSocketPayload(socket, payload) {
+    if (socket.readyState !== WebSocket.OPEN) {
+        throw new Error("WhatsApp WebSocket is not open.");
+    }
+    if (socket.bufferedAmount + payload.byteLength > MAX_WHATSAPP_WEBSOCKET_BUFFERED_BYTES) {
+        socket.terminate();
+        throw new Error("WhatsApp WebSocket outbound buffer limit exceeded.");
+    }
+    await new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (error) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timeout);
+            if (error) {
+                reject(error);
+            }
+            else {
+                resolve();
+            }
+        };
+        const timeout = setTimeout(() => {
+            socket.terminate();
+            finish(new Error("WhatsApp WebSocket send timed out."));
+        }, WHATSAPP_WEBSOCKET_SEND_TIMEOUT_MS);
+        try {
+            socket.send(payload, finish);
+        }
+        catch (error) {
+            finish(error instanceof Error ? error : new Error(String(error)));
+        }
+    });
+}
+export function resolveWhatsAppWebSocketClose(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const code = /(?:backlog|exceeds|limit|payload is too large|too many)/iu.test(message)
+        ? 1009
+        : /(?:baileys|binary node|handshake|noise|protocol|unexpected end|unsupported|invalid)/iu.test(message)
+            ? 1002
+            : 1011;
+    return { code, reason: truncateWebSocketCloseReason(message) };
+}
+function truncateWebSocketCloseReason(reason) {
+    let result = "";
+    for (const character of reason) {
+        if (Buffer.byteLength(result + character) > MAX_WHATSAPP_WEBSOCKET_CLOSE_REASON_BYTES) {
+            break;
+        }
+        result += character;
+    }
+    return result;
+}
+export function attachWhatsAppBaileysWebSocketServer(params) {
+    const signalBundles = new WhatsAppSignalBundleStore(undefined, undefined, undefined, undefined, undefined, { messageAcceptanceTimeoutMs: params.messageAcceptanceTimeoutMs });
+    const sessions = new Set();
+    const pendingSessionMessages = new Set();
+    const pendingMessages = [];
+    const maxPendingInboundMessages = resolveMaxPendingWhatsAppInboundMessages(params.maxPendingInboundMessages);
+    let pendingReservations = 0;
+    let closing = false;
+    let flushPromise = Promise.resolve();
+    const webSocketServerOptions = {
+        maxBufferedChunks: MAX_WHATSAPP_WEBSOCKET_FRAGMENTS,
+        maxFragments: MAX_WHATSAPP_WEBSOCKET_FRAGMENTS,
+        maxPayload: MAX_WHATSAPP_WEBSOCKET_MESSAGE_BYTES,
+        noServer: true,
+    };
+    const wss = new WebSocketServer(webSocketServerOptions);
+    const flushPendingMessages = () => {
+        const next = flushPromise.then(async () => {
+            while (pendingMessages.length > 0) {
+                if (closing) {
+                    return;
+                }
+                const message = pendingMessages[0];
+                if (!message) {
+                    return;
+                }
+                const results = await Promise.all([...sessions].map((session) => session.deliverInboundMessage(message)));
+                if (!results.some(Boolean)) {
+                    return;
+                }
+                pendingMessages.shift();
+            }
+        });
+        flushPromise = next.catch(() => undefined);
+        return next;
+    };
+    const rejectUpgrade = (socket, response) => {
+        socket.end(response, () => socket.destroy());
+    };
+    const handleUpgrade = (request, socket, head) => {
+        const url = parseWhatsAppWebSocketUpgradeUrl(request.url);
+        if (!url) {
+            rejectUpgrade(socket, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+            return;
+        }
+        if (url.pathname !== params.path) {
+            socket.destroy();
+            return;
+        }
+        if (url.searchParams.get("access_token") !== params.accessToken) {
+            rejectUpgrade(socket, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+            return;
+        }
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            wss.emit("connection", ws, request);
+        });
+    };
+    params.httpServer.on("upgrade", handleUpgrade);
+    wss.on("connection", (socket) => {
+        const session = new WhatsAppBaileysWebSocketSession(socket, {
+            appendEvent: params.appendEvent,
+            onOpen: () => {
+                void flushPendingMessages();
+            },
+            path: params.path,
+            selfJid: params.selfJid,
+            signalBundles,
+        });
+        sessions.add(session);
+        socket.once("close", () => {
+            session.abortAcceptance(new Error("WhatsApp WebSocket closed."));
+            sessions.delete(session);
+        });
+        socket.on("error", () => {
+            session.abortAcceptance(new Error("WhatsApp WebSocket failed."));
+            sessions.delete(session);
+            socket.terminate();
+        });
+        socket.on("message", (data) => {
+            const pending = session.handleMessage(data);
+            pendingSessionMessages.add(pending);
+            void pending.then(() => pendingSessionMessages.delete(pending), () => pendingSessionMessages.delete(pending));
+        });
+    });
+    return {
+        async close() {
+            closing = true;
+            params.httpServer.off("upgrade", handleUpgrade);
+            pendingMessages.length = 0;
+            for (const session of sessions) {
+                session.abortAcceptance(new Error("WhatsApp WebSocket server is shutting down."));
+            }
+            await closeWebSocketServer(wss);
+            const messageResults = await Promise.allSettled([...pendingSessionMessages]);
+            await flushPromise;
+            const messageErrors = messageResults.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+            if (messageErrors.length === 1) {
+                throw messageErrors[0];
+            }
+            if (messageErrors.length > 1) {
+                throw new AggregateError(messageErrors, "WhatsApp WebSocket message drain failed.");
+            }
+        },
+        prepareInboundMessage(message) {
+            if (pendingMessages.length + pendingReservations >= maxPendingInboundMessages) {
+                return undefined;
+            }
+            let reserved = true;
+            let settled = false;
+            pendingReservations += 1;
+            const releaseReservation = () => {
+                if (reserved) {
+                    reserved = false;
+                    pendingReservations -= 1;
+                }
+            };
+            return {
+                cancel() {
+                    if (!settled) {
+                        settled = true;
+                        releaseReservation();
+                    }
+                },
+                async commit() {
+                    if (settled) {
+                        throw new Error("WhatsApp inbound delivery reservation is already settled.");
+                    }
+                    settled = true;
+                    try {
+                        releaseReservation();
+                        if (pendingMessages.length >= maxPendingInboundMessages) {
+                            throw new Error("WhatsApp inbound delivery reservation exceeded queue capacity.");
+                        }
+                        pendingMessages.push(message);
+                        await flushPendingMessages();
+                        return pendingMessages.includes(message) ? "queued" : "delivered";
+                    }
+                    finally {
+                        releaseReservation();
+                    }
+                },
+            };
+        },
+    };
+}
+export function parseWhatsAppWebSocketUpgradeUrl(requestTarget) {
+    try {
+        return new URL(requestTarget ?? "/", "http://127.0.0.1");
+    }
+    catch {
+        return undefined;
+    }
+}
+function rawDataByteLength(data) {
+    if (Array.isArray(data)) {
+        return data.reduce((total, chunk) => total + chunk.byteLength, 0);
+    }
+    return data.byteLength;
+}
+function rawDataToBuffer(data) {
+    if (Buffer.isBuffer(data)) {
+        return data;
+    }
+    if (Array.isArray(data)) {
+        return Buffer.concat(data);
+    }
+    return Buffer.from(data);
+}
+function removeNoiseIntroHeader(chunk) {
+    if (chunk.subarray(0, NOISE_WA_HEADER.length).equals(NOISE_WA_HEADER)) {
+        return chunk.subarray(NOISE_WA_HEADER.length);
+    }
+    if (chunk.length >= 11 && chunk.subarray(0, 2).toString("utf8") === "ED" && chunk[3] === 1) {
+        const routingInfoPrefix = chunk[4];
+        if (routingInfoPrefix === undefined) {
+            throw new Error("Invalid Baileys Noise routing header.");
+        }
+        const routingInfoLength = (routingInfoPrefix << 16) | chunk.readUInt16BE(5);
+        const headerLength = 7 + routingInfoLength + NOISE_WA_HEADER.length;
+        if (chunk.subarray(headerLength - NOISE_WA_HEADER.length, headerLength).equals(NOISE_WA_HEADER)) {
+            return chunk.subarray(headerLength);
+        }
+    }
+    throw new Error("Invalid Baileys Noise intro header.");
+}
+function children(node) {
+    return Array.isArray(node.content) ? node.content : [];
+}
+export async function persistAcceptedBaileysMessage(params) {
+    const peer = canonicalizeWhatsAppUserCorrelationJid(params.node.attrs.to ?? "");
+    const messageId = params.node.attrs.id;
+    if (!peer || !messageId) {
+        return false;
+    }
+    const messageKey = `${peer}\0${messageId}`;
+    const wasPreviouslyPersisted = params.signalBundles.hasPersistedMessage(messageKey);
+    let persistenceSucceeded = wasPreviouslyPersisted;
+    let operationSettled;
+    const operationSettlement = new Promise((resolve) => {
+        operationSettled = resolve;
+    });
+    let requiresSignalCommit = wasPreviouslyPersisted;
+    let signalCommitSucceeded = false;
+    const pendingAcceptanceOperations = new Set();
+    const trackAcceptanceOperation = (operation) => {
+        pendingAcceptanceOperations.add(operation);
+        void operation.then(() => {
+            persistenceSucceeded = true;
+            pendingAcceptanceOperations.delete(operation);
+        }, () => pendingAcceptanceOperations.delete(operation));
+        return operation;
+    };
+    const drainAcceptanceOperations = async () => {
+        while (pendingAcceptanceOperations.size > 0) {
+            await Promise.allSettled([...pendingAcceptanceOperations]);
+        }
+        await operationSettlement;
+        if (!persistenceSucceeded) {
+            params.signalBundles.releaseMessagePreKeyProtection(messageKey);
+            return "retryable";
+        }
+        if (!requiresSignalCommit || signalCommitSucceeded) {
+            params.signalBundles.releaseMessagePreKeyProtection(messageKey);
+            return "acknowledged";
+        }
+        return "persisted";
+    };
+    const accepted = await params.signalBundles.acceptMessageOnce(messageKey, async (acceptanceSignal) => {
+        try {
+            acceptanceSignal.throwIfAborted();
+            const candidates = encryptedMessageCandidates(params.node);
+            requiresSignalCommit = candidates.length > 0;
+            if (candidates.length === 0) {
+                if (!wasPreviouslyPersisted) {
+                    await awaitWithAbort(trackAcceptanceOperation(params.appendEvent({
+                        accepted: true,
+                        at: new Date().toISOString(),
+                        body: sanitizeNodeForJson(params.node),
+                        method: "WEBSOCKET",
+                        path: params.path,
+                        query: {},
+                        type: "api",
+                    })), acceptanceSignal);
+                }
+                return true;
+            }
+            const remoteCorrelationJid = canonicalizeWhatsAppUserCorrelationJid(params.remoteJid);
+            candidates.sort((left, right) => {
+                const leftIsSelf = canonicalizeWhatsAppUserCorrelationJid(left.recipientJid) === remoteCorrelationJid;
+                const rightIsSelf = canonicalizeWhatsAppUserCorrelationJid(right.recipientJid) === remoteCorrelationJid;
+                return Number(leftIsSelf) - Number(rightIsSelf);
+            });
+            for (const candidate of candidates) {
+                const result = await params.signalBundles.transactDirectMessage({
+                    accept: async (decrypted) => {
+                        let text;
+                        try {
+                            text = readWhatsAppConversation(unpadRandomMax16(decrypted));
+                        }
+                        catch {
+                            text = undefined;
+                        }
+                        const message = text
+                            ? {
+                                key: {
+                                    fromMe: true,
+                                    id: messageId,
+                                    remoteJid: peer,
+                                },
+                                message: { conversation: text },
+                                messageTimestamp: Math.floor(Date.now() / 1000),
+                            }
+                            : undefined;
+                        if (!wasPreviouslyPersisted) {
+                            await awaitWithAbort(trackAcceptanceOperation(params.appendEvent({
+                                accepted: true,
+                                at: new Date().toISOString(),
+                                body: message ?? sanitizeNodeForJson(params.node),
+                                method: "WEBSOCKET",
+                                path: params.path,
+                                query: {},
+                                type: "api",
+                            })), acceptanceSignal);
+                        }
+                        return true;
+                    },
+                    ciphertext: candidate.ciphertext,
+                    messageKey,
+                    recipientJid: candidate.recipientJid,
+                    remoteJid: params.remoteJid,
+                    signal: acceptanceSignal,
+                    type: candidate.type,
+                });
+                if (result.status === "accepted") {
+                    signalCommitSucceeded = true;
+                    return true;
+                }
+            }
+            return false;
+        }
+        finally {
+            if (!acceptanceSignal.aborted && !signalCommitSucceeded) {
+                params.signalBundles.releaseMessagePreKeyProtection(messageKey);
+            }
+            operationSettled();
+        }
+    }, {
+        onTerminalTimeout: params.onAcceptanceTimeout,
+        signal: params.acceptanceSignal,
+        terminalDrain: drainAcceptanceOperations,
+    });
+    if (accepted) {
+        params.signalBundles.clearPersistedMessage(messageKey);
+    }
+    return accepted;
+}
+function encryptedMessageCandidates(node) {
+    const result = [];
+    const visit = (current, recipientJid) => {
+        const nextRecipient = current.tag === "to" ? current.attrs.jid : recipientJid;
+        if (current.tag === "enc" &&
+            nextRecipient &&
+            (current.attrs.type === "msg" || current.attrs.type === "pkmsg") &&
+            current.content instanceof Uint8Array) {
+            result.push({
+                ciphertext: current.content,
+                recipientJid: nextRecipient,
+                type: current.attrs.type,
+            });
+        }
+        for (const child of children(current)) {
+            visit(child, nextRecipient);
+        }
+    };
+    visit(node);
+    return result;
+}
+function signalKeyPair(pair) {
+    return {
+        privKey: Buffer.from(pair.private),
+        pubKey: ensureSignalPublicKey(pair.public),
+    };
+}
+function cloneSignalSession(session) {
+    return SessionRecord.deserialize(session.serialize());
+}
+export function signalBundleIdentityKey(jid) {
+    return jid.replace(/(?:_\d+)?(?::\d+)?(?=@)/u, "");
+}
+function signalProtocolAddress(jid) {
+    const match = /^(\d{7,15})(?:_(\d+))?(?::(\d+))?@(s\.whatsapp\.net|lid)$/iu.exec(jid);
+    if (!match) {
+        return undefined;
+    }
+    const deviceId = Number(match[3] ?? "0");
+    if (!Number.isSafeInteger(deviceId) || deviceId < 0) {
+        return undefined;
+    }
+    const agent = match[2];
+    const server = match[4].toLowerCase();
+    return {
+        deviceId,
+        name: agent !== undefined ? `${match[1]}_${agent}` : server === "lid" ? `${match[1]}_1` : match[1],
+    };
+}
+function unpadRandomMax16(value) {
+    const buffer = Buffer.from(value);
+    const padding = buffer.at(-1);
+    if (!padding || padding > 16 || padding > buffer.length) {
+        throw new Error("Invalid WhatsApp message padding.");
+    }
+    for (let index = buffer.length - padding; index < buffer.length; index += 1) {
+        if (buffer[index] !== padding) {
+            throw new Error("Invalid WhatsApp message padding.");
+        }
+    }
+    return buffer.subarray(0, buffer.length - padding);
+}
+function readWhatsAppConversation(message) {
+    const fields = readProtobufLengthDelimitedFields(message);
+    const conversation = readUtf8(fields.get(1)?.[0]);
+    if (conversation?.trim()) {
+        return conversation;
+    }
+    const extendedText = fields.get(6)?.[0];
+    const extendedConversation = extendedText
+        ? readUtf8(readProtobufLengthDelimitedFields(extendedText).get(1)?.[0])
+        : undefined;
+    if (extendedConversation?.trim()) {
+        return extendedConversation;
+    }
+    const deviceSentMessage = fields.get(31)?.[0];
+    const nestedMessage = deviceSentMessage
+        ? readProtobufLengthDelimitedFields(deviceSentMessage).get(2)?.[0]
+        : undefined;
+    return nestedMessage ? readWhatsAppConversation(nestedMessage) : undefined;
+}
+const MAX_WHATSAPP_PROTOBUF_GROUP_DEPTH = 64;
+function readProtobufLengthDelimitedFields(value) {
+    const fields = new Map();
+    let offset = 0;
+    while (offset < value.length) {
+        const tag = readProtobufVarint(value, offset);
+        offset = tag.offset;
+        const fieldNumber = tag.value >>> 3;
+        const wireType = tag.value & 7;
+        if (fieldNumber < 1) {
+            throw new Error("Invalid WhatsApp protobuf field.");
+        }
+        if (wireType === 2) {
+            const length = readProtobufVarint(value, offset);
+            offset = length.offset;
+            const end = offset + length.value;
+            if (end > value.length) {
+                throw new Error("Invalid WhatsApp protobuf length.");
+            }
+            const entries = fields.get(fieldNumber) ?? [];
+            entries.push(value.subarray(offset, end));
+            fields.set(fieldNumber, entries);
+            offset = end;
+            continue;
+        }
+        if (wireType === 0) {
+            offset = skipWhatsAppProtobufField(value, offset, fieldNumber, wireType, 0);
+            continue;
+        }
+        offset = skipWhatsAppProtobufField(value, offset, fieldNumber, wireType, 0);
+    }
+    return fields;
+}
+function skipWhatsAppProtobufField(value, offset, fieldNumber, wireType, groupDepth) {
+    if (wireType === 0) {
+        return readProtobufVarint(value, offset).offset;
+    }
+    if (wireType === 1) {
+        const end = offset + 8;
+        if (end > value.length) {
+            throw new Error("Invalid WhatsApp protobuf fixed64 field.");
+        }
+        return end;
+    }
+    if (wireType === 2) {
+        const length = readProtobufVarint(value, offset);
+        const end = length.offset + length.value;
+        if (end > value.length) {
+            throw new Error("Invalid WhatsApp protobuf length.");
+        }
+        return end;
+    }
+    if (wireType === 3) {
+        if (groupDepth >= MAX_WHATSAPP_PROTOBUF_GROUP_DEPTH) {
+            throw new Error("WhatsApp protobuf group nesting exceeds the supported depth.");
+        }
+        let nestedOffset = offset;
+        while (nestedOffset < value.length) {
+            const tag = readProtobufVarint(value, nestedOffset);
+            nestedOffset = tag.offset;
+            const nestedFieldNumber = tag.value >>> 3;
+            const nestedWireType = tag.value & 7;
+            if (nestedFieldNumber < 1) {
+                throw new Error("Invalid WhatsApp protobuf field.");
+            }
+            if (nestedWireType === 4) {
+                if (nestedFieldNumber !== fieldNumber) {
+                    throw new Error("Mismatched WhatsApp protobuf end group.");
+                }
+                return nestedOffset;
+            }
+            nestedOffset = skipWhatsAppProtobufField(value, nestedOffset, nestedFieldNumber, nestedWireType, groupDepth + 1);
+        }
+        throw new Error("Unterminated WhatsApp protobuf group.");
+    }
+    if (wireType === 4) {
+        throw new Error("Unexpected WhatsApp protobuf end group.");
+    }
+    if (wireType === 5) {
+        const end = offset + 4;
+        if (end > value.length) {
+            throw new Error("Invalid WhatsApp protobuf fixed32 field.");
+        }
+        return end;
+    }
+    throw new Error(`Unsupported WhatsApp protobuf wire type: ${wireType}.`);
+}
+function readProtobufVarint(value, start) {
+    let result = 0;
+    let shift = 0;
+    let offset = start;
+    while (offset < value.length && shift <= 28) {
+        const byte = value[offset++];
+        result += (byte & 0x7f) * 2 ** shift;
+        if ((byte & 0x80) === 0) {
+            if (!Number.isSafeInteger(result)) {
+                break;
+            }
+            return { offset, value: result };
+        }
+        shift += 7;
+    }
+    throw new Error("Invalid WhatsApp protobuf varint.");
+}
+function readUtf8(value) {
+    if (!value) {
+        return undefined;
+    }
+    const text = Buffer.from(value).toString("utf8");
+    return Buffer.from(text, "utf8").equals(Buffer.from(value)) ? text : undefined;
+}
+function createInboundMessageNode(message) {
+    const from = message.key.remoteJid;
+    const attrs = {
+        from,
+        id: message.key.id,
+        notify: message.pushName ?? "Test User",
+        t: String(message.messageTimestamp),
+    };
+    if (isGroupJid(from) && message.key.participant) {
+        attrs.participant = message.key.participant;
+    }
+    return {
+        attrs,
+        content: [
+            {
+                attrs: {},
+                content: encodePlaintextInboundMessage(message.message),
+                tag: "plaintext",
+            },
+        ],
+        tag: "message",
+    };
+}
+function createIv(counter) {
+    const iv = Buffer.alloc(IV_LENGTH);
+    iv.writeUInt32BE(counter, 8);
+    return iv;
+}
+function encodeLengthPrefixed(data) {
+    const frame = Buffer.allocUnsafe(3 + data.byteLength);
+    frame[0] = (data.byteLength >>> 16) & 0xff;
+    frame[1] = (data.byteLength >>> 8) & 0xff;
+    frame[2] = data.byteLength & 0xff;
+    frame.set(data, 3);
+    return frame;
+}
+function firstChild(node) {
+    return children(node)[0];
+}
+function encodePlaintextConversationMessage(text) {
+    const textBytes = Buffer.from(text, "utf8");
+    return Buffer.from([0x0a, ...encodeVarint(textBytes.byteLength), ...textBytes]);
+}
+function encodePlaintextInboundMessage(message) {
+    if (message.audioMessage) {
+        return encodePlaintextAudioMessage(message.audioMessage);
+    }
+    return encodePlaintextConversationMessage(message.conversation);
+}
+function encodePlaintextAudioMessage(audio) {
+    const fields = [
+        encodeLengthDelimitedProtobufField(1, Buffer.from(audio.url, "utf8")),
+        encodeLengthDelimitedProtobufField(2, Buffer.from(audio.mimetype, "utf8")),
+        encodeLengthDelimitedProtobufField(3, audio.fileSha256),
+        encodeVarintProtobufField(4, audio.fileLength),
+        ...(audio.seconds === undefined ? [] : [encodeVarintProtobufField(5, audio.seconds)]),
+        encodeVarintProtobufField(6, audio.ptt ? 1 : 0),
+        encodeLengthDelimitedProtobufField(7, audio.mediaKey),
+        encodeLengthDelimitedProtobufField(8, audio.fileEncSha256),
+        encodeVarintProtobufField(10, audio.mediaKeyTimestamp),
+    ];
+    return encodeLengthDelimitedProtobufField(8, Buffer.concat(fields));
+}
+function encodeLengthDelimitedProtobufField(fieldNumber, value) {
+    return Buffer.concat([
+        Buffer.from(encodeVarint((fieldNumber << 3) | 2)),
+        Buffer.from(encodeVarint(value.byteLength)),
+        Buffer.from(value),
+    ]);
+}
+function encodeVarintProtobufField(fieldNumber, value) {
+    return Buffer.from([...encodeVarint(fieldNumber << 3), ...encodeVarint(value)]);
+}
+function encodeVarint(value) {
+    const bytes = [];
+    let remaining = value;
+    while (remaining >= 0x80) {
+        bytes.push((remaining & 0x7f) | 0x80);
+        remaining = Math.floor(remaining / 0x80);
+    }
+    bytes.push(remaining);
+    return bytes;
+}
+function isGroupJid(jid) {
+    return jid.endsWith("@g.us");
+}
+function requireAttr(node, name) {
+    const value = node.attrs[name];
+    if (!value) {
+        throw new Error(`Baileys node <${node.tag}> requires ${name}.`);
+    }
+    return value;
+}
+function lidForJid(jid) {
+    const user = jid.split("@", 1)[0]?.split(":", 1)[0] ?? "15550000000";
+    return `${user}@lid`;
+}
+function sanitizeNodeForJson(value) {
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+        return { base64: Buffer.from(value).toString("base64"), type: "Buffer" };
+    }
+    if (Array.isArray(value)) {
+        return value.map(sanitizeNodeForJson);
+    }
+    if (value && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, sanitizeNodeForJson(entry)]));
+    }
+    return value;
+}
+function unixSeconds() {
+    return Math.floor(Date.now() / 1000).toString();
+}
+//# sourceMappingURL=whatsapp-baileys-websocket.js.map

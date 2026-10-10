@@ -1,0 +1,833 @@
+import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import { isIP } from "node:net";
+import path from "node:path";
+import { adminAuthError, closeServer, createServerClose, drainRequestBody, formatUrlHost, hasAdminToken, InvalidJsonBodyError, isJsonObject, jsonResponse, parseUnknownRequestBody, queryRecord, readInteger, readTrimmedString, RequestBodyTooLargeError, writeResponse, } from "./http.js";
+import { createServerRecorder, ServerRecorderCommittedError, } from "./recorder.js";
+import { resolveMaxPendingInboundEvents } from "./pending-events.js";
+const SIGNAL_CLI_SSE_KEEPALIVE_MS = 15_000;
+const DEFAULT_MAX_SIGNAL_SSE_CLIENTS = 32;
+const MAX_SIGNAL_SSE_BUFFER_BYTES = 2 * 1024 * 1024;
+const SIGNAL_PHONE_NUMBER_RE = /^\+[1-9]\d{2,14}$/u;
+const SIGNAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+async function appendEvent(state, event, committed = false) {
+    await (committed ? state.recorder.recordCommitted(event) : state.recorder.record(event));
+}
+function rpcResponse(id, result) {
+    return jsonResponse({ id: id ?? null, jsonrpc: "2.0", result });
+}
+function rpcError(code, message, id = null, status = 400) {
+    return jsonResponse({
+        error: { code, message },
+        id: id ?? null,
+        jsonrpc: "2.0",
+    }, status);
+}
+function removeSignalClient(state, client, destroy) {
+    const buffer = state.clientBuffers.get(client);
+    state.clients.delete(client);
+    state.clientBuffers.delete(client);
+    const bufferedEvents = new Set([
+        ...state.pendingEvents,
+        ...[...state.clientBuffers.values()].flatMap((entry) => [...entry.inFlight, ...entry.events]),
+        ...(buffer ? [...buffer.inFlight, ...buffer.events] : []),
+    ]);
+    for (const event of bufferedEvents) {
+        event.recipients?.delete(client);
+    }
+    if (buffer) {
+        const restoredEvents = [...new Set([...buffer.inFlight, ...buffer.events])].filter((event) => event.sequence !== undefined &&
+            event.recipients?.size === 0 &&
+            !isSignalEventBuffered(state, event));
+        if (restoredEvents.length > 0) {
+            state.pendingEvents.push(...restoredEvents);
+            state.pendingEvents.sort((left, right) => (left.sequence ?? Number.MAX_SAFE_INTEGER) - (right.sequence ?? 0));
+            state.pendingEventBytes += restoredEvents.reduce((total, event) => total + Buffer.byteLength(event.data), 0);
+        }
+    }
+    if (destroy) {
+        client.destroy();
+    }
+    if (state.pendingEvents.length > 0 && state.clients.size > 0) {
+        queueMicrotask(() => flushPendingSignalEvents(state));
+    }
+}
+function evictSignalClient(state, client) {
+    removeSignalClient(state, client, true);
+}
+function scheduleSignalDrain(state, client) {
+    const buffer = state.clientBuffers.get(client);
+    if (!buffer || buffer.draining || client.destroyed || client.writableEnded) {
+        return;
+    }
+    buffer.draining = true;
+    client.once("drain", () => {
+        const current = state.clientBuffers.get(client);
+        if (current) {
+            current.bytes -= current.inFlight.reduce((total, event) => total + Buffer.byteLength(event.data), 0);
+            current.inFlight.length = 0;
+            current.draining = false;
+            flushSignalClientEvents(state, client);
+            const remaining = state.clientBuffers.get(client);
+            if (remaining && remaining.events.length === 0 && !client.writableNeedDrain) {
+                flushPendingSignalEvents(state);
+            }
+        }
+    });
+}
+function queueSignalClientEvent(state, client, event) {
+    const buffer = state.clientBuffers.get(client);
+    const eventBytes = Buffer.byteLength(event.data);
+    const alreadyBuffered = isSignalEventBuffered(state, event);
+    const pendingEventBytes = state.pendingEvents.includes(event) ? 0 : eventBytes;
+    if (!buffer ||
+        (!alreadyBuffered && signalBufferedEventCount(state) >= state.maxPendingInboundEvents) ||
+        state.pendingEventBytes + buffer.bytes + pendingEventBytes > MAX_SIGNAL_SSE_BUFFER_BYTES) {
+        evictSignalClient(state, client);
+        return "rejected";
+    }
+    buffer.events.push(event);
+    buffer.bytes += eventBytes;
+    event.recipients?.add(client);
+    scheduleSignalDrain(state, client);
+    return "queued";
+}
+function writeSignalSse(state, client, event) {
+    if (client.destroyed) {
+        removeSignalClient(state, client, false);
+        return "rejected";
+    }
+    if (client.writableEnded) {
+        evictSignalClient(state, client);
+        return "rejected";
+    }
+    const eventBytes = Buffer.byteLength(event.data);
+    if (eventBytes > MAX_SIGNAL_SSE_BUFFER_BYTES) {
+        return "rejected";
+    }
+    const buffer = state.clientBuffers.get(client);
+    if (client.writableNeedDrain || buffer?.draining || buffer?.events.length) {
+        return queueSignalClientEvent(state, client, event);
+    }
+    if (client.writableLength + eventBytes > MAX_SIGNAL_SSE_BUFFER_BYTES) {
+        evictSignalClient(state, client);
+        return "rejected";
+    }
+    const accepted = client.write(event.data);
+    event.recipients?.add(client);
+    if (!accepted) {
+        if (buffer) {
+            buffer.inFlight.push(event);
+            buffer.bytes += eventBytes;
+        }
+        scheduleSignalDrain(state, client);
+    }
+    return "accepted";
+}
+function maxSignalClientBufferBytes(state) {
+    let maxBytes = 0;
+    for (const buffer of state.clientBuffers.values()) {
+        maxBytes = Math.max(maxBytes, buffer.bytes);
+    }
+    return maxBytes;
+}
+function isSignalEventBuffered(state, event) {
+    return (state.pendingEvents.includes(event) ||
+        [...state.clientBuffers.values()].some((buffer) => buffer.inFlight.includes(event) || buffer.events.includes(event)));
+}
+function signalBufferedEventCount(state) {
+    const sequences = new Set();
+    for (const event of state.pendingEvents) {
+        if (event.sequence !== undefined) {
+            sequences.add(event.sequence);
+        }
+    }
+    for (const buffer of state.clientBuffers.values()) {
+        for (const event of [...buffer.inFlight, ...buffer.events]) {
+            if (event.sequence !== undefined) {
+                sequences.add(event.sequence);
+            }
+        }
+    }
+    return sequences.size;
+}
+function queueSignalEvent(state, event) {
+    const eventBytes = Buffer.byteLength(event.data);
+    if (eventBytes > MAX_SIGNAL_SSE_BUFFER_BYTES ||
+        state.pendingEventBytes + maxSignalClientBufferBytes(state) + eventBytes >
+            MAX_SIGNAL_SSE_BUFFER_BYTES ||
+        (!isSignalEventBuffered(state, event) &&
+            signalBufferedEventCount(state) >= state.maxPendingInboundEvents)) {
+        return false;
+    }
+    state.pendingEvents.push(event);
+    state.pendingEventBytes += eventBytes;
+    return true;
+}
+function replayExclusiveSignalEvents(state, client) {
+    const events = new Map();
+    for (const [owner, buffer] of state.clientBuffers) {
+        if (owner === client) {
+            continue;
+        }
+        for (const event of [...buffer.inFlight, ...buffer.events]) {
+            if (event.sequence !== undefined &&
+                event.recipients?.size === 1 &&
+                event.recipients.has(owner)) {
+                events.set(event.sequence, event);
+            }
+        }
+    }
+    for (const event of [...events.values()].sort((left, right) => left.sequence - right.sequence)) {
+        if (writeSignalSse(state, client, event) === "rejected") {
+            break;
+        }
+    }
+}
+function flushSignalClientEvents(state, client) {
+    while (!client.writableNeedDrain) {
+        const buffer = state.clientBuffers.get(client);
+        if (!buffer || buffer.events.length === 0) {
+            break;
+        }
+        const event = buffer.events.shift();
+        if (!client.write(event.data)) {
+            buffer.inFlight.push(event);
+            scheduleSignalDrain(state, client);
+            break;
+        }
+        buffer.bytes -= Buffer.byteLength(event.data);
+    }
+}
+function flushPendingSignalEvents(state) {
+    while (state.pendingEvents.length > 0 && state.clients.size > 0) {
+        const event = state.pendingEvents[0];
+        for (const client of [...state.clients]) {
+            if (!event.recipients?.has(client)) {
+                writeSignalSse(state, client, event);
+            }
+        }
+        if (state.clients.size === 0 ||
+            [...state.clients].some((client) => !event.recipients?.has(client))) {
+            break;
+        }
+        state.pendingEvents.shift();
+        state.pendingEventBytes -= Buffer.byteLength(event.data);
+    }
+}
+function emitSignalEvent(state, payload) {
+    const event = {
+        data: `event:receive\ndata:${JSON.stringify(payload)}\n\n`,
+        recipients: new Set(),
+        sequence: state.nextEventSequence++,
+    };
+    if (state.clients.size === 0 || state.pendingEvents.length > 0) {
+        return queueSignalEvent(state, event);
+    }
+    let delivered = false;
+    for (const client of state.clients) {
+        const result = writeSignalSse(state, client, event);
+        delivered = result === "accepted" || result === "queued" || delivered;
+    }
+    return delivered || queueSignalEvent(state, event);
+}
+function normalizeSignalPhoneNumber(value) {
+    const number = readTrimmedString(value)?.replace(/[\s().-]/gu, "");
+    return number && SIGNAL_PHONE_NUMBER_RE.test(number) ? number : undefined;
+}
+function isSignalDirectRecipient(value) {
+    const recipient = readSignalRpcString(value);
+    if (!recipient) {
+        return false;
+    }
+    if (SIGNAL_UUID_RE.test(recipient)) {
+        return true;
+    }
+    // signal-cli treats recognized prefixes as terminal instead of retrying them as phone numbers.
+    if (recipient.startsWith("PNI:")) {
+        return SIGNAL_UUID_RE.test(recipient.slice(4));
+    }
+    if (recipient.startsWith("u:")) {
+        return recipient.length > 2;
+    }
+    return SIGNAL_PHONE_NUMBER_RE.test(recipient);
+}
+function nextSignalTimestamp(state) {
+    return Math.max(state.nextTimestamp, (state.lastCommittedTimestamp ?? -1) + 1);
+}
+function commitSignalTimestamp(state, timestamp) {
+    state.lastCommittedTimestamp = timestamp;
+    state.nextTimestamp = Math.max(state.nextTimestamp, timestamp + 1);
+}
+async function handleAdminInbound(params) {
+    const text = typeof params.body.text === "string" ? params.body.text : undefined;
+    const sourceNumberValue = params.body.sourceNumber ?? params.body.senderId;
+    const sourceNumber = normalizeSignalPhoneNumber(sourceNumberValue);
+    const sourceUuidValue = readTrimmedString(params.body.sourceUuid);
+    const sourceUuid = sourceUuidValue && SIGNAL_UUID_RE.test(sourceUuidValue)
+        ? sourceUuidValue.toLowerCase()
+        : undefined;
+    if (sourceNumberValue !== undefined && sourceNumber === undefined) {
+        return jsonResponse({ error: "sourceNumber must be an E.164 telephone number", ok: false }, 400);
+    }
+    if (params.body.sourceUuid !== undefined && sourceUuid === undefined) {
+        return jsonResponse({ error: "sourceUuid must be a UUID", ok: false }, 400);
+    }
+    if (!text || text.trim().length === 0 || (!sourceNumber && !sourceUuid)) {
+        return jsonResponse({ error: "text and at least one source identity are required", ok: false }, 400);
+    }
+    const suppliedTimestamp = params.body.timestamp === undefined ? undefined : readInteger(params.body.timestamp);
+    if (params.body.timestamp !== undefined &&
+        (suppliedTimestamp === undefined ||
+            suppliedTimestamp < 0 ||
+            suppliedTimestamp >= Number.MAX_SAFE_INTEGER)) {
+        return jsonResponse({ error: "timestamp must be a non-negative safe integer with room to advance", ok: false }, 400);
+    }
+    if (suppliedTimestamp !== undefined &&
+        params.state.lastCommittedTimestamp !== undefined &&
+        suppliedTimestamp <= params.state.lastCommittedTimestamp) {
+        return jsonResponse({ error: "timestamp must be greater than the last committed timestamp", ok: false }, 409);
+    }
+    const timestamp = suppliedTimestamp ?? nextSignalTimestamp(params.state);
+    if (timestamp >= Number.MAX_SAFE_INTEGER) {
+        return jsonResponse({ error: "timestamp capacity exhausted", ok: false }, 503);
+    }
+    const groupId = readTrimmedString(params.body.groupId);
+    const payload = {
+        envelope: {
+            sourceName: readTrimmedString(params.body.sourceName ?? params.body.senderName),
+            ...(sourceNumber ? { sourceNumber } : {}),
+            ...(sourceUuid ? { sourceUuid } : {}),
+            timestamp,
+            dataMessage: {
+                message: text,
+                timestamp,
+                ...(groupId ? { groupInfo: { groupId } } : {}),
+            },
+        },
+    };
+    if (!emitSignalEvent(params.state, payload)) {
+        return jsonResponse({
+            error: `Pending inbound queue is full (${params.state.maxPendingInboundEvents} events)`,
+            ok: false,
+        }, 503);
+    }
+    commitSignalTimestamp(params.state, timestamp);
+    return jsonResponse({ event: payload, ok: true });
+}
+async function handleRpc(params) {
+    const hasId = Object.hasOwn(params.body, "id");
+    const id = params.body.id;
+    const validId = !hasId ||
+        id === null ||
+        typeof id === "string" ||
+        (typeof id === "number" &&
+            Number.isFinite(id) &&
+            (!Number.isInteger(id) || Number.isSafeInteger(id)));
+    const method = params.body.method;
+    if (typeof method !== "string" || !validId) {
+        return {
+            accepted: false,
+            record: false,
+            response: rpcError(-32600, "Invalid Request", validId ? id : null),
+        };
+    }
+    if (params.body.jsonrpc !== "2.0") {
+        return {
+            accepted: false,
+            record: false,
+            response: rpcError(-32600, "Invalid Request", id),
+        };
+    }
+    const notification = !hasId;
+    if (params.body.params !== undefined &&
+        !Array.isArray(params.body.params) &&
+        !isJsonObject(params.body.params)) {
+        return {
+            accepted: false,
+            record: false,
+            response: rpcError(-32600, "Invalid Request", id),
+        };
+    }
+    if (method === "version") {
+        return {
+            accepted: false,
+            record: true,
+            response: notification
+                ? new Response(null, { status: 204 })
+                : rpcResponse(id, { version: "crabline-signal-1" }),
+        };
+    }
+    if (["send", "sendReaction", "sendReceipt", "sendTyping"].includes(method)) {
+        if (!validSignalRpcParams(method, params.body.params)) {
+            return {
+                accepted: false,
+                record: false,
+                response: notification
+                    ? new Response(null, { status: 204 })
+                    : rpcError(-32602, "Invalid params", id, 200),
+            };
+        }
+        const account = params.body.params.account;
+        if (typeof account === "string" && account !== params.state.account) {
+            return {
+                accepted: false,
+                record: false,
+                response: notification
+                    ? new Response(null, { status: 204 })
+                    : rpcError(-32602, "Specified account does not exist", id, 200),
+            };
+        }
+        const timestamp = nextSignalTimestamp(params.state);
+        if (timestamp >= Number.MAX_SAFE_INTEGER) {
+            return {
+                accepted: false,
+                record: false,
+                response: notification
+                    ? new Response(null, { status: 204 })
+                    : rpcError(-32603, "Timestamp capacity exhausted", id, 200),
+            };
+        }
+        return {
+            accepted: true,
+            record: true,
+            response: notification
+                ? new Response(null, { status: 204 })
+                : rpcResponse(id, method === "sendTyping" ? {} : { timestamp }),
+            timestamp,
+        };
+    }
+    return {
+        accepted: false,
+        record: false,
+        response: notification
+            ? new Response(null, { status: 204 })
+            : jsonResponse({
+                error: { code: -32601, message: `Method not found: ${method}` },
+                id: id ?? null,
+                jsonrpc: "2.0",
+            }),
+    };
+}
+function hasRecipients(params) {
+    const values = [
+        params.recipient,
+        params.recipients,
+        params.groupId,
+        params.groupIds,
+        params.username,
+        params.usernames,
+    ];
+    return (params.noteToSelf === true ||
+        values.some((value) => (typeof value === "string" && value.trim().length > 0) ||
+            (Array.isArray(value) &&
+                value.length > 0 &&
+                value.every((entry) => typeof entry === "string" && entry.trim().length > 0))));
+}
+function hasTypingRecipients(params) {
+    if (params.noteToSelf !== undefined ||
+        params.username !== undefined ||
+        params.usernames !== undefined ||
+        (params.stop !== undefined && typeof params.stop !== "boolean")) {
+        return false;
+    }
+    return [params.recipient, params.recipients, params.groupId, params.groupIds].some((value) => (typeof value === "string" && value.trim().length > 0) ||
+        (Array.isArray(value) &&
+            value.length > 0 &&
+            value.every((entry) => typeof entry === "string" && entry.trim().length > 0)));
+}
+function validTimestamp(value) {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function hasStringArray(value) {
+    return (Array.isArray(value) &&
+        value.length > 0 &&
+        value.every((entry) => typeof entry === "string" && entry.trim().length > 0));
+}
+function readSignalRpcString(value) {
+    if (typeof value !== "string") {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+}
+function hasValidSignalRecipientFieldTypes(params) {
+    return ["recipient", "recipients", "groupId", "groupIds", "username", "usernames"].every((field) => {
+        const value = params[field];
+        return (value === undefined ||
+            (typeof value === "string" && value.trim().length > 0) ||
+            hasStringArray(value));
+    });
+}
+function hasValidOptionalSignalString(params, field) {
+    return params[field] === undefined || typeof params[field] === "string";
+}
+function hasValidSignalDirectRecipients(params) {
+    return ["recipient", "recipients"].every((field) => {
+        const value = params[field];
+        return (value === undefined ||
+            (Array.isArray(value)
+                ? value.length > 0 && value.every(isSignalDirectRecipient)
+                : isSignalDirectRecipient(value)));
+    });
+}
+function validSignalRpcParams(method, value) {
+    if (!isJsonObject(value) ||
+        !hasValidSignalRecipientFieldTypes(value) ||
+        !hasValidSignalDirectRecipients(value) ||
+        !hasValidOptionalSignalString(value, "account") ||
+        (value.noteToSelf !== undefined && typeof value.noteToSelf !== "boolean")) {
+        return false;
+    }
+    if (method === "send") {
+        return (hasValidOptionalSignalString(value, "message") &&
+            hasValidOptionalSignalString(value, "attachment") &&
+            (value.attachments === undefined || hasStringArray(value.attachments)) &&
+            hasRecipients(value) &&
+            (readSignalRpcString(value.message) !== undefined ||
+                readSignalRpcString(value.attachment) !== undefined ||
+                hasStringArray(value.attachments)));
+    }
+    if (method === "sendReaction") {
+        return (hasValidOptionalSignalString(value, "emoji") &&
+            hasValidOptionalSignalString(value, "targetAuthor") &&
+            hasRecipients(value) &&
+            readSignalRpcString(value.emoji) !== undefined &&
+            isSignalDirectRecipient(value.targetAuthor) &&
+            validTimestamp(value.targetTimestamp));
+    }
+    if (method === "sendReceipt") {
+        const targetTimestamps = value.targetTimestamps ?? value.targetTimestamp;
+        const timestamps = Array.isArray(targetTimestamps) ? targetTimestamps : [targetTimestamps];
+        return (hasValidOptionalSignalString(value, "type") &&
+            (readSignalRpcString(value.recipient) !== undefined ||
+                readSignalRpcString(value.username) !== undefined ||
+                hasStringArray(value.usernames)) &&
+            timestamps.length > 0 &&
+            timestamps.every(validTimestamp) &&
+            (value.type === undefined || value.type === "read" || value.type === "viewed"));
+    }
+    return method === "sendTyping" && hasTypingRecipients(value);
+}
+function serializeSignalTimestampCommit(state, operation) {
+    const run = state.pendingTimestampCommits.catch(() => { }).then(operation);
+    state.pendingTimestampCommits = run.then(() => undefined, () => undefined);
+    return run;
+}
+function processSignalAdminInbound(params) {
+    return serializeSignalTimestampCommit(params.state, () => handleAdminInbound(params));
+}
+async function processSignalRpc(params) {
+    return serializeSignalTimestampCommit(params.state, async () => {
+        const rpc = await handleRpc({ body: params.body, state: params.state });
+        if (rpc.record) {
+            const event = {
+                accepted: rpc.accepted,
+                at: new Date().toISOString(),
+                body: params.body,
+                method: "POST",
+                path: params.url.pathname,
+                query: queryRecord(params.url),
+                type: "api",
+            };
+            if (rpc.accepted) {
+                try {
+                    await appendEvent(params.state, event);
+                }
+                catch (error) {
+                    if (!(error instanceof ServerRecorderCommittedError)) {
+                        throw error;
+                    }
+                }
+                commitSignalTimestamp(params.state, rpc.timestamp);
+            }
+            else {
+                await appendEvent(params.state, event, rpc.response.status === 204);
+            }
+        }
+        return rpc.response;
+    });
+}
+function hasSignalJsonContentType(request) {
+    const contentType = request.headers["content-type"];
+    const values = Array.isArray(contentType) ? contentType : [contentType];
+    return values.some((value) => value?.split(";", 1)[0]?.trim().toLowerCase() === "application/json");
+}
+async function handleRequest(params) {
+    const url = params.url;
+    if (url.pathname === "/api/v1/events" && params.request.method === "GET") {
+        if (params.state.clients.size + params.state.pendingSseClients >= params.state.maxSseClients) {
+            await writeResponse(params.response, jsonResponse({ error: "Too many event stream clients", ok: false }, 503));
+            return;
+        }
+        params.state.pendingSseClients += 1;
+        try {
+            await appendEvent(params.state, {
+                at: new Date().toISOString(),
+                method: "GET",
+                path: url.pathname,
+                query: queryRecord(url),
+                type: "api",
+            });
+        }
+        finally {
+            params.state.pendingSseClients -= 1;
+        }
+        if (params.request.destroyed || params.response.destroyed) {
+            return;
+        }
+        params.response.writeHead(200, {
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+            "content-type": "text/event-stream",
+        });
+        params.response.once("close", () => {
+            removeSignalClient(params.state, params.response, false);
+        });
+        params.state.clients.add(params.response);
+        params.state.clientBuffers.set(params.response, {
+            bytes: 0,
+            draining: false,
+            events: [],
+            inFlight: [],
+        });
+        params.response.flushHeaders();
+        replayExclusiveSignalEvents(params.state, params.response);
+        if (params.state.clients.has(params.response)) {
+            flushPendingSignalEvents(params.state);
+        }
+        return;
+    }
+    let fetchResponse;
+    if (url.pathname === "/crabline/signal/inbound" && params.request.method === "POST") {
+        if (!hasAdminToken(params.request, params.state.adminToken)) {
+            drainRequestBody(params.request);
+            fetchResponse = adminAuthError();
+        }
+        else {
+            const body = await parseUnknownRequestBody(params.request);
+            if (!isJsonObject(body)) {
+                fetchResponse = jsonResponse({ error: "Request body must be a JSON object", ok: false }, 400);
+                await writeResponse(params.response, fetchResponse);
+                return;
+            }
+            await appendEvent(params.state, {
+                at: new Date().toISOString(),
+                body,
+                method: "POST",
+                path: url.pathname,
+                query: queryRecord(url),
+                type: "admin",
+            });
+            fetchResponse = await processSignalAdminInbound({ body, state: params.state });
+        }
+    }
+    else if (url.pathname === "/api/v1/check" && params.request.method === "GET") {
+        await appendEvent(params.state, {
+            accepted: true,
+            at: new Date().toISOString(),
+            method: "GET",
+            path: url.pathname,
+            query: queryRecord(url),
+            type: "api",
+        });
+        fetchResponse = new Response(null, { status: 200 });
+    }
+    else if (url.pathname === "/api/v1/rpc" && params.request.method === "POST") {
+        if (!hasSignalJsonContentType(params.request)) {
+            drainRequestBody(params.request);
+            fetchResponse = new Response(null, { status: 415 });
+        }
+        else {
+            const body = await parseUnknownRequestBody(params.request);
+            if (!isJsonObject(body)) {
+                await writeResponse(params.response, rpcError(-32600, "Invalid Request"));
+                return;
+            }
+            fetchResponse = await processSignalRpc({ body, state: params.state, url });
+        }
+    }
+    else {
+        fetchResponse = new Response("not found", { status: 404 });
+    }
+    await writeResponse(params.response, fetchResponse);
+}
+function normalizeSignalHost(value) {
+    const normalized = value
+        .trim()
+        .replace(/^\[(.*)\]$/u, "$1")
+        .toLowerCase()
+        .replace(/\.$/u, "");
+    if (isIP(normalized) !== 6) {
+        return normalized;
+    }
+    const canonical = new URL(`http://[${normalized}]`).hostname.slice(1, -1);
+    const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/u.exec(canonical);
+    if (!mapped?.[1] || !mapped[2]) {
+        return canonical;
+    }
+    const high = Number.parseInt(mapped[1], 16);
+    const low = Number.parseInt(mapped[2], 16);
+    return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
+}
+function parseSignalHostHeader(value) {
+    const match = value.startsWith("[")
+        ? /^\[([^\]]+)\](?::(\d{1,5}))?$/u.exec(value)
+        : /^([^:]+)(?::(\d{1,5}))?$/u.exec(value);
+    if (!match?.[1]) {
+        return undefined;
+    }
+    const port = match[2] === undefined ? undefined : Number(match[2]);
+    if (port !== undefined && port > 65_535) {
+        return undefined;
+    }
+    const hostname = normalizeSignalHost(match[1]);
+    if (isIP(hostname) !== 0) {
+        return hostname;
+    }
+    const labels = hostname.split(".");
+    return hostname.length <= 253 &&
+        labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label))
+        ? hostname
+        : undefined;
+}
+function signalRequestHostAllowed(request, bindHost, allowedHosts) {
+    const hostHeader = request.headers.host;
+    if (!hostHeader) {
+        return false;
+    }
+    const requestedHost = parseSignalHostHeader(hostHeader);
+    if (requestedHost === undefined) {
+        return false;
+    }
+    const normalizedBindHost = normalizeSignalHost(bindHost);
+    if (allowedHosts.has(requestedHost)) {
+        return true;
+    }
+    if (normalizedBindHost !== "0.0.0.0" && normalizedBindHost !== "::") {
+        return false;
+    }
+    const localAddress = normalizeSignalHost(request.socket.localAddress ?? "");
+    return isIP(requestedHost) !== 0 && requestedHost === localAddress;
+}
+export async function startSignalServer(params = {}) {
+    const account = normalizeSignalPhoneNumber(params.account ?? "+15550000000");
+    if (!account) {
+        throw new Error("account must be an E.164 telephone number.");
+    }
+    const recorderPath = params.recorderPath ?? path.resolve(".crabline", "servers", "signal.jsonl");
+    const state = {
+        account,
+        adminToken: params.adminToken ?? randomBytes(24).toString("base64url"),
+        clients: new Set(),
+        clientBuffers: new Map(),
+        lastCommittedTimestamp: undefined,
+        maxPendingInboundEvents: resolveMaxPendingInboundEvents(params.maxPendingInboundEvents),
+        maxSseClients: Number.isSafeInteger(params.maxSseClients) && (params.maxSseClients ?? 0) > 0
+            ? params.maxSseClients
+            : DEFAULT_MAX_SIGNAL_SSE_CLIENTS,
+        nextEventSequence: 1,
+        nextTimestamp: Date.now(),
+        recorder: createServerRecorder({ recorderPath, onEvent: params.onEvent }),
+        pendingEventBytes: 0,
+        pendingEvents: [],
+        pendingTimestampCommits: Promise.resolve(),
+        pendingSseClients: 0,
+        recorderPath,
+    };
+    const host = params.host ?? "127.0.0.1";
+    const normalizedHost = normalizeSignalHost(host);
+    const allowedHosts = new Set([
+        ...(normalizedHost === "0.0.0.0" || normalizedHost === "::" ? [] : [normalizedHost]),
+        ...(params.allowedHosts ?? []).map((allowedHost) => normalizeSignalHost(allowedHost)),
+    ]);
+    const server = createServer((request, response) => {
+        if (!signalRequestHostAllowed(request, host, allowedHosts)) {
+            drainRequestBody(request);
+            void writeResponse(response, jsonResponse({ error: "Host header is not allowed", ok: false }, 400)).catch(() => response.destroy());
+            return;
+        }
+        let url;
+        try {
+            url = new URL(request.url ?? "/", "http://localhost");
+        }
+        catch {
+            drainRequestBody(request);
+            void writeResponse(response, jsonResponse({ error: "Invalid request URL", ok: false }, 400)).catch(() => response.destroy());
+            return;
+        }
+        void handleRequest({ request, response, state, url }).catch(async (error) => {
+            if (!response.headersSent) {
+                let errorResponse;
+                const isAdminRequest = url.pathname === "/crabline/signal/inbound";
+                if (error instanceof InvalidJsonBodyError) {
+                    errorResponse = isAdminRequest
+                        ? jsonResponse({ error: "Request body is not valid JSON", ok: false }, 400)
+                        : rpcError(-32700, "Parse error");
+                }
+                else if (error instanceof RequestBodyTooLargeError) {
+                    errorResponse = isAdminRequest
+                        ? jsonResponse({ error: "Request body is too large", ok: false }, 413)
+                        : rpcError(-32600, "Request body is too large", null, 413);
+                }
+                else {
+                    errorResponse = jsonResponse({ error: "internal server error", ok: false }, 500);
+                }
+                try {
+                    await writeResponse(response, errorResponse);
+                }
+                catch (writeError) {
+                    response.destroy(writeError instanceof Error ? writeError : new Error(String(writeError)));
+                }
+            }
+            else {
+                response.destroy(error instanceof Error ? error : new Error(String(error)));
+            }
+        });
+    });
+    await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(params.port ?? 0, host, () => {
+            server.off("error", reject);
+            resolve();
+        });
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") {
+        await closeServer(server);
+        throw new Error("Unable to resolve Signal local server address.");
+    }
+    const keepalive = setInterval(() => {
+        for (const client of state.clients) {
+            writeSignalSse(state, client, { data: ":\n" });
+        }
+    }, SIGNAL_CLI_SSE_KEEPALIVE_MS);
+    keepalive.unref();
+    const advertisedHost = normalizedHost === "0.0.0.0" ? "127.0.0.1" : normalizedHost === "::" ? "::1" : host;
+    const baseUrl = `http://${formatUrlHost(advertisedHost)}:${address.port}`;
+    return {
+        close: createServerClose(state.recorder, async () => {
+            clearInterval(keepalive);
+            for (const client of state.clients) {
+                client.end();
+            }
+            await closeServer(server);
+        }),
+        manifest: {
+            account: state.account,
+            adminToken: state.adminToken,
+            baseUrl,
+            endpoints: {
+                adminInboundUrl: `${baseUrl}/crabline/signal/inbound`,
+                apiRoot: baseUrl,
+                eventsUrl: `${baseUrl}/api/v1/events`,
+                rpcUrl: `${baseUrl}/api/v1/rpc`,
+            },
+            env: {},
+            provider: "signal",
+            recorderPath: state.recorderPath,
+            version: 1,
+        },
+    };
+}
+//# sourceMappingURL=signal.js.map

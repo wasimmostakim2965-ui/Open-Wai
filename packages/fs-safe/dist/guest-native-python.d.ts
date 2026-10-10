@@ -1,0 +1,3 @@
+export declare const GUEST_FILESYSTEM_CREATE_STAGING_PYTHON: string;
+export declare const GUEST_FILESYSTEM_RENAME_NO_REPLACE_PYTHON: string;
+export declare const GUEST_FILESYSTEM_CREATE_EXCLUSIVE_PYTHON: string;

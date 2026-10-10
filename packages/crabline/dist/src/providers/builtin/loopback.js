@@ -1,0 +1,289 @@
+import { randomUUID } from "node:crypto";
+import { CrablineError } from "../../core/errors.js";
+import { LocalMockProviderAdapter, resolveGeneratedLocalMockRecorderPath } from "../local-mock.js";
+import { getBuiltinTargetCodec } from "../target-normalizers.js";
+const LOOPBACK_V2_PREFIX = "loopback+v2:";
+function createMessageId() {
+    return `loopback-mock-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function cloneRawMessage(raw) {
+    return { ...raw };
+}
+function cloneMessage(message) {
+    return {
+        ...message,
+        author: { ...message.author },
+        metadata: {
+            dateSent: new Date(message.metadata.dateSent),
+            edited: message.metadata.edited,
+            ...(message.metadata.editedAt ? { editedAt: new Date(message.metadata.editedAt) } : {}),
+        },
+        raw: cloneRawMessage(message.raw),
+    };
+}
+function toPostableText(message) {
+    if (typeof message === "string") {
+        return message;
+    }
+    if ("raw" in message) {
+        return message.raw;
+    }
+    if ("markdown" in message) {
+        return message.markdown;
+    }
+    return message.fallbackText ?? "[card]";
+}
+function malformedThreadAddress(cause) {
+    return new CrablineError("Loopback v2 thread address is malformed.", {
+        ...(cause === undefined ? {} : { cause }),
+        kind: "inbound",
+    });
+}
+function encodeThreadAddressComponent(value) {
+    if (!value) {
+        throw malformedThreadAddress();
+    }
+    try {
+        return encodeURIComponent(value);
+    }
+    catch (error) {
+        throw malformedThreadAddress(error);
+    }
+}
+function decodeThreadAddressComponent(value) {
+    let decoded;
+    let canonical;
+    try {
+        decoded = decodeURIComponent(value);
+        canonical = encodeURIComponent(decoded);
+    }
+    catch (error) {
+        throw malformedThreadAddress(error);
+    }
+    if (!decoded || canonical !== value) {
+        throw malformedThreadAddress();
+    }
+    return decoded;
+}
+export class LoopbackChatAdapter {
+    name = "loopback";
+    persistMessageHistory = true;
+    userName;
+    #messages = new Map();
+    #nextSequence = new Map();
+    #lastMessageTimestamp = -1;
+    constructor(userName) {
+        this.userName = userName;
+    }
+    addReaction() {
+        return Promise.resolve();
+    }
+    channelIdFromThreadId(threadId) {
+        const address = this.decodeThreadId(threadId);
+        return address.channelId ?? address.id;
+    }
+    decodeThreadId(threadId) {
+        if (threadId.startsWith(LOOPBACK_V2_PREFIX)) {
+            const threadParts = threadId.split("::");
+            if (threadParts.length > 2) {
+                throw malformedThreadAddress();
+            }
+            const [address = "", rawThreadId] = threadParts;
+            const addressParts = address.slice(LOOPBACK_V2_PREFIX.length).split(":");
+            if ((addressParts.length !== 1 && addressParts.length !== 2) ||
+                addressParts.some((part) => part.length === 0) ||
+                rawThreadId === "") {
+                throw malformedThreadAddress();
+            }
+            const [rawChannelOrId = "", rawId] = addressParts;
+            const decoded = {
+                id: decodeThreadAddressComponent(rawId ?? rawChannelOrId),
+            };
+            if (rawId !== undefined) {
+                decoded.channelId = decodeThreadAddressComponent(rawChannelOrId);
+            }
+            if (rawThreadId !== undefined) {
+                decoded.threadId = decodeThreadAddressComponent(rawThreadId);
+            }
+            return decoded;
+        }
+        const [address = threadId, rawThreadId] = threadId.split("::");
+        const [, channelId = address, id = address] = address.split(":");
+        const decoded = { id };
+        if (channelId) {
+            decoded.channelId = channelId;
+        }
+        if (rawThreadId) {
+            decoded.threadId = rawThreadId;
+        }
+        return decoded;
+    }
+    deleteMessage(threadId, messageId) {
+        const messages = this.#messages.get(threadId) ?? [];
+        this.#messages.set(threadId, messages.filter((entry) => entry.message.id !== messageId));
+        return Promise.resolve();
+    }
+    editMessage(threadId, messageId, message) {
+        const messages = this.#messages.get(threadId) ?? [];
+        const stored = messages.find((entry) => entry.message.id === messageId);
+        if (!stored) {
+            throw new CrablineError(`Loopback message not found: ${messageId}`, { kind: "inbound" });
+        }
+        const existing = stored.message;
+        const text = toPostableText(message);
+        existing.text = text;
+        existing.formatted = text;
+        existing.metadata.edited = true;
+        existing.metadata.editedAt = new Date(this.#nextMessageTimestamp());
+        existing.raw.text = text;
+        return Promise.resolve({ id: existing.id, raw: cloneRawMessage(existing.raw), threadId });
+    }
+    encodeThreadId(platformData) {
+        const id = encodeThreadAddressComponent(platformData.id);
+        const address = platformData.channelId === undefined
+            ? `${LOOPBACK_V2_PREFIX}${id}`
+            : `${LOOPBACK_V2_PREFIX}${encodeThreadAddressComponent(platformData.channelId)}:${id}`;
+        return platformData.threadId === undefined
+            ? address
+            : `${address}::${encodeThreadAddressComponent(platformData.threadId)}`;
+    }
+    fetchMessages(threadId, options) {
+        const storedMessages = [...(this.#messages.get(threadId) ?? [])];
+        if (options?.limit !== undefined &&
+            (!Number.isSafeInteger(options.limit) || options.limit <= 0)) {
+            throw new CrablineError("Loopback message limit must be a positive safe integer.", {
+                kind: "config",
+            });
+        }
+        const limit = options?.limit ?? storedMessages.length;
+        let cursor;
+        if (options?.cursor !== undefined) {
+            if (!/^[1-9]\d*$/u.test(options.cursor)) {
+                throw new CrablineError("Loopback message cursor must be a positive safe integer.", {
+                    kind: "config",
+                });
+            }
+            cursor = Number(options.cursor);
+            if (!Number.isSafeInteger(cursor) || cursor > (this.#nextSequence.get(threadId) ?? 0)) {
+                throw new CrablineError("Loopback message cursor must be a positive safe integer within message history.", { kind: "config" });
+            }
+        }
+        const eligibleMessages = cursor === undefined
+            ? storedMessages
+            : storedMessages.filter((entry) => entry.sequence < cursor);
+        const page = eligibleMessages.slice(-limit);
+        const result = {
+            messages: page.map((entry) => cloneMessage(entry.message)),
+        };
+        if (eligibleMessages.length > page.length && page[0]) {
+            result.nextCursor = String(page[0].sequence);
+        }
+        return Promise.resolve(result);
+    }
+    fetchThread(threadId) {
+        const address = this.decodeThreadId(threadId);
+        return Promise.resolve({
+            channelId: address.channelId ?? address.id,
+            id: threadId,
+            isDM: address.channelId === undefined,
+            metadata: {},
+        });
+    }
+    handleWebhook(_request) {
+        return Promise.resolve(new Response("loopback adapter has no webhook surface", { status: 501 }));
+    }
+    isDM() {
+        return true;
+    }
+    parseMessage(raw) {
+        return {
+            author: {
+                isMe: raw.author === "assistant",
+                userName: raw.author === "assistant" ? this.userName : "loopback",
+            },
+            formatted: raw.text,
+            id: raw.id,
+            metadata: {
+                dateSent: new Date(raw.timestamp),
+                edited: false,
+            },
+            raw: cloneRawMessage(raw),
+            text: raw.text,
+            threadId: raw.threadId,
+        };
+    }
+    postMessage(threadId, message) {
+        const text = toPostableText(message);
+        const raw = {
+            author: "assistant",
+            id: createMessageId(),
+            text,
+            threadId,
+            timestamp: this.#nextMessageTimestamp(),
+        };
+        const parsed = this.parseMessage(raw);
+        this.#append(threadId, parsed);
+        return Promise.resolve({ id: raw.id, raw: cloneRawMessage(raw), threadId });
+    }
+    removeReaction() {
+        return Promise.resolve();
+    }
+    renderFormatted(content) {
+        return content;
+    }
+    startTyping() {
+        return Promise.resolve();
+    }
+    ingestUserMessage(threadId, text) {
+        const raw = {
+            author: "user",
+            id: createMessageId(),
+            text,
+            threadId,
+            timestamp: this.#nextMessageTimestamp(),
+        };
+        const parsed = this.parseMessage(raw);
+        this.#append(threadId, parsed);
+        return cloneMessage(parsed);
+    }
+    listSince(threadId, since) {
+        const sinceTime = new Date(since).getTime();
+        if (!Number.isFinite(sinceTime)) {
+            throw new CrablineError("Loopback since timestamp must be a valid date.", {
+                kind: "config",
+            });
+        }
+        return (this.#messages.get(threadId) ?? [])
+            .map((entry) => entry.message)
+            .filter((message) => message.metadata.dateSent.getTime() >= sinceTime)
+            .map(cloneMessage);
+    }
+    #append(threadId, message) {
+        const bucket = this.#messages.get(threadId) ?? [];
+        const sequence = (this.#nextSequence.get(threadId) ?? 0) + 1;
+        bucket.push({ message: cloneMessage(message), sequence });
+        this.#messages.set(threadId, bucket);
+        this.#nextSequence.set(threadId, sequence);
+    }
+    #nextMessageTimestamp() {
+        const timestamp = Math.max(Date.now(), this.#lastMessageTimestamp + 1);
+        this.#lastMessageTimestamp = timestamp;
+        return new Date(timestamp).toISOString();
+    }
+}
+export class LoopbackProviderAdapter extends LocalMockProviderAdapter {
+    constructor(id, config, _userName) {
+        super({
+            codec: getBuiltinTargetCodec("loopback"),
+            config,
+            id,
+            options: {
+                defaultWebhook: { host: "127.0.0.1", path: "/loopback/webhook", port: 0 },
+                endpointLabel: "webhook endpoint",
+                platform: "loopback",
+                recorderPath: resolveGeneratedLocalMockRecorderPath(id, `-${randomUUID()}`),
+            },
+        });
+    }
+}
+//# sourceMappingURL=loopback.js.map

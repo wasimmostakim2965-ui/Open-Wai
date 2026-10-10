@@ -1,0 +1,244 @@
+import type { RetainedFileResult } from "./retained-file-types.js";
+export type NativePublicationTransition = {
+    outcome: "committed" | "not-published" | "indeterminate";
+    errorCode?: string;
+    errorMessage?: string;
+};
+export interface NativeWindowsEntryPublication {
+    readonly admission: {
+        outcome: string;
+        errorCode?: string;
+        errorMessage?: string;
+    };
+    current(published: boolean): void;
+    publish(): NativePublicationTransition;
+    close(): {
+        code: string;
+        message: string;
+    }[];
+}
+export interface NativeRetainedFile {
+    readonly admission: RetainedFileResult | {
+        status: "retained";
+        identity: string;
+    };
+    settle(remove: boolean): RetainedFileResult;
+}
+import type { TarMeterLimits } from "./archive-limits.js";
+import type { ArchiveMemberKind } from "./archive-plan.js";
+import type { CopyCloneMode } from "./copy-policy.js";
+import type { WindowsAceFlags } from "./owner-dacl.js";
+export interface NativeFileHash {
+    bytes: number;
+    digest: string;
+}
+export interface NativeFileIdentity {
+    dev: number;
+    ino: number;
+    mode: number;
+    nlink: number;
+    size: number;
+    isFile: boolean;
+    isDirectory: boolean;
+    isSymbolicLink: boolean;
+}
+export interface NativeDirectoryObservation {
+    dev: bigint;
+    ino: bigint;
+    realPath: string;
+}
+export interface NativeDirectoryFdObservation extends NativeDirectoryObservation {
+    mode: bigint;
+    nlink: bigint;
+}
+export interface NativeArchiveEntry {
+    index: number;
+    path: string;
+    kind: ArchiveMemberKind;
+    size: number;
+    mode: number;
+}
+export interface NativeArchivePlanEntry extends NativeArchiveEntry {
+}
+export interface NativeCopyResult {
+    fd: number;
+    bytes: number;
+    errorCode?: string;
+    errorMessage?: string;
+}
+export interface NativeFileCopyResult {
+    fd: number;
+    method: "clone" | "copy-file-range" | "copy";
+    errorCode?: string;
+    errorMessage?: string;
+}
+export interface NativeOpenBeneathResult {
+    fd: number;
+    containment: "kernel-atomic" | "best-effort";
+}
+export interface NativeOwnedTreeRemovalResult {
+    outcome?: "removed" | "preserved";
+    errorCode?: string;
+    errorMessage?: string;
+}
+export interface NativeRootRemovalEntry {
+    dev: bigint;
+    ino: bigint;
+    directory: boolean;
+    symlink: boolean;
+}
+export interface NativeRootRemovalDirectory {
+    readonly fd: number;
+    read(): string | null;
+    close(): void;
+}
+export interface NativeWindowsAccessControlEntry {
+    sid: string;
+    mask: number;
+    aceType: string;
+    flags: WindowsAceFlags;
+}
+export interface NativeWindowsSecurityFacts {
+    ownerSid: string;
+    currentUserSid: string;
+    ownerClass: string;
+    worldWritable: boolean;
+    groupWritable: boolean;
+    worldReadable: boolean;
+    groupReadable: boolean;
+    fallbackRequired: boolean;
+    daclPresent: boolean;
+    isLocal: boolean;
+    aceListComplete: boolean;
+    unsupportedAceTypes: number[];
+    aces: NativeWindowsAccessControlEntry[];
+}
+export interface NativeWindowsDescriptorSecurityFacts {
+    /** Canonical lowercase 32-bit volume serial and 64-bit file-index projection used by Node. */
+    identity: string;
+    security: NativeWindowsSecurityFacts;
+}
+export interface NativeWindowsDirectoryReceipt {
+    /** Canonical 64-bit volume serial and all 128 file-ID bits, in Windows byte order. */
+    identity: string;
+}
+export interface NativeDarwinAclFacts {
+    state: "absent" | "empty" | "present";
+}
+type NativeTwoPathArgs = [
+    sourceRootFd: number,
+    sourceRelPath: string,
+    targetRootFd: number,
+    targetRelPath: string
+];
+export interface NativeBinding {
+    rootRemovalStat?(parent: number, name: string): NativeRootRemovalEntry;
+    rootRemovalUnlink?(parent: number, name: string, dev: bigint, ino: bigint, directory: boolean): void;
+    openRootRemovalDirectory?(parent: number, name: string, dev: bigint, ino: bigint): NativeRootRemovalDirectory;
+    openCreateBeneath?(parentFd: number, basename: string, flags: number, mode: number): number;
+    renameReplaceWithIdentity?(sourceParent: number, source: string, targetParent: number, target: string, dev: bigint, ino: bigint): void;
+    /** Windows-only, private handle custody; no borrowed/runtime descriptors. */
+    retainWindowsFile?(directory: string, basename: string, parentDev: bigint, parentIno: bigint, dev: bigint, ino: bigint, size: bigint, mtimeNs: bigint, ctimeNs: bigint, sha256: string, maxBytes: number): NativeRetainedFile;
+    watchRegister?(root: string, limit: number, callback: (batch: import("./watch-native.js").NativeWatchWireBatch) => void, persistent: boolean): number;
+    watchConfigure?(id: number, anchors: string[], exclusions: string[]): void;
+    watchEntries?(id: number, entries: import("./watch-native.js").NativeWatchEntry[]): {
+        directories: number;
+        changed: boolean;
+    };
+    watchAdd?(id: number, directory: {
+        root: string;
+        relative: string;
+        rootDev: bigint;
+        rootIno: bigint;
+        dev: bigint;
+        ino: bigint;
+    }): void;
+    watchTestEvent?(id: number, path: string, flags: number): void;
+    watchUnregister?(id: number): void;
+    watchThreadCount?(): number;
+    watchMemoryStats?(): {
+        registrations: number;
+        pendingSets: number;
+        payloadsLive: number;
+        payloadsCreated: number;
+        payloadsDestroyed: number;
+        threadsafeFunctionsLive: number;
+        threadsafeFunctionsCreated: number;
+        threadsafeFunctionsDestroyed: number;
+    };
+    /** Internal: consumes only a descriptor returned by this binding. */
+    closeOwnedFd(fd: number): void;
+    /** Internal Darwin-only synchronous inspection; the caller retains its fd. */
+    inspectDarwinAcl?(fd: number, inheritanceTarget?: "file" | "directory"): NativeDarwinAclFacts;
+    /** POSIX system canonicalization; confinement and identity policy stay with callers. */
+    canonicalizePath?(path: string, ordinary: boolean): {
+        path?: string;
+        errno?: number;
+    };
+    /** Internal: exact directory identity and canonical path from one no-follow handle. */
+    observeDirectory?(path: string): NativeDirectoryObservation;
+    /** Internal POSIX-only exact name/descriptor observation; the caller retains its fd. */
+    observeDirectoryFd?(fd: number, expectedPath: string): NativeDirectoryFdObservation;
+    /** Linux/Windows byte transfer; callers retain both admitted descriptors until settlement. */
+    copyFileContents?(sourceFd: number, targetFd: number, signal?: AbortSignal): Promise<void>;
+    /** Internal: same private, immutable input ownership as the ZIP buffer reader. */
+    openTarBufferNative(buffer: Buffer, kind: string, limits: TarMeterLimits, signal?: AbortSignal): Promise<{
+        readonly entries: NativeArchiveEntry[];
+        readEntry(index: number, maxBytes: number, signal?: AbortSignal): Promise<Buffer>;
+    }>;
+    /** Internal: input remains private, unpooled and immutable until the reader is released. */
+    openZipBufferNative(buffer: Buffer, limits: TarMeterLimits, signal?: AbortSignal): Promise<{
+        readonly entries: NativeArchiveEntry[];
+        readEntry(index: number, maxBytes: number, signal?: AbortSignal): Promise<Buffer>;
+    }>;
+    readCloneFileMetadata(paths: string[]): Promise<(Buffer | null)[]>;
+    probeTreeClone(parentFd: number): "apfs" | "btrfs" | "refs" | "xfs" | "zfs" | null;
+    cloneTree(sourceFd: number | null, parentFd: number, basename: string, concurrency: number, signal?: AbortSignal): Promise<void>;
+    openStagedSymlink?(parentFd: number, basename: string): number;
+    stagedSymlinkTarget?(parentFd: number, basename: string, linkFd: number): string;
+    stagedSymlinkMatches?(parentFd: number, basename: string, linkFd: number): boolean;
+    publishStagedSymlink?(parentFd: number, basename: string, linkFd: number, destination: string): void;
+    removeStagedSymlink?(parentFd: number, basename: string, linkFd: number): "removed" | "name-absent" | "preserved";
+    createStagedFile?(parentFd: number, basename: string): number;
+    stagedFileMatches?(parentFd: number, basename: string, fileFd: number): boolean;
+    removeStagedFile?(parentFd: number, basename: string, fileFd: number): "removed" | "name-absent" | "preserved";
+    copyFileExclusive?(sourceFd: number, parentFd: number, basename: string, clone: CopyCloneMode, maxBytes: number | undefined, signal: AbortSignal | undefined): Promise<NativeFileCopyResult>;
+    cloneFileExclusive(sourceFd: number, targetRootFd: number, targetRelPath: string): number;
+    copyFileRangeExclusive(sourceFd: number, targetRootFd: number, targetRelPath: string): Promise<NativeCopyResult>;
+    createPrivateDirectory(path: string): void;
+    /** Internal Windows creation receipts use full FILE_ID_INFO, never Node's projection. */
+    inspectWindowsDirectory?(path: string, requirePrivate: boolean): NativeWindowsDirectoryReceipt;
+    createPrivateDirectoryWithParentIdentity?(path: string, expectedParentIdentity: string): NativeWindowsDirectoryReceipt;
+    /** Protects an already-private borrowed Node file; descriptor ownership stays with Node. */
+    protectPrivateWindowsFile?(fd: number, path: string, expectedParentIdentity: string): NativeWindowsDirectoryReceipt;
+    verifyPrivateWindowsFile?(fd: number, path: string, expectedFileIdentity: string, expectedParentIdentity: string, expectedLinks: number): void;
+    extractArchiveNative(path: string, kind: string, rootFd: number, plan: NativeArchivePlanEntry[], limits: TarMeterLimits, signal: AbortSignal): Promise<void>;
+    fstatIdentity(fd: number): NativeFileIdentity;
+    inspectArchiveNative(path: string, kind: string, limits: TarMeterLimits, signal: AbortSignal): Promise<NativeArchiveEntry[]>;
+    linkBeneath(...args: NativeTwoPathArgs): void;
+    /** Direct-child mkdir; true is receipt provenance only, never cleanup ownership. */
+    mkdirChildBeneath?(parentFd: number, basename: string, mode: number): boolean;
+    mkdirOpenChildBeneath?(parentFd: number, basename: string, mode: number, flags: number): {
+        fd: number;
+        created: boolean;
+    };
+    mkdirBeneath(rootFd: number, relPath: string, mode: number): void;
+    openBeneath(rootFd: number, relPath: string, flags: number): NativeOpenBeneathResult;
+    readOwnerAndDacl(path: string): NativeWindowsSecurityFacts;
+    /** Internal Windows-only inspection of the exact borrowed Node descriptor. */
+    inspectWindowsSecureFileHandle?(fd: number): NativeWindowsDescriptorSecurityFacts;
+    ownedTreeRemovalAvailable?(parentFd: number): boolean;
+    removeOwnedTree?(parentFd: number, basename: string, directoryFd: number): Promise<NativeOwnedTreeRemovalResult>;
+    removeOwnedTreeSync?(parentFd: number, basename: string, directoryFd: number): NativeOwnedTreeRemovalResult;
+    /** Local filesystem admission for one-way cooperative entry publication. */
+    retainWindowsEntryPublication?(sourcePath: string, name: string, sourceDev: bigint, sourceIno: bigint, targetPath: string, targetName: string, targetDev: bigint, targetIno: bigint, dev: bigint, ino: bigint, kind: "file" | "directory" | "symlink"): NativeWindowsEntryPublication;
+    entryPublicationFilesystem?(parentFd: number): string;
+    publishRetainedEntryNoReplace?(sourceParentFd: number, sourceBasename: string, sourceFd: number, targetParentFd: number, targetBasename: string): NativePublicationTransition;
+    renameNoReplace(...args: NativeTwoPathArgs): void;
+    /** Identity-fenced retained-directory rename capability. */
+    renameNoReplaceWithIdentity?(...args: [...paths: NativeTwoPathArgs, expectedSourceDev: bigint, expectedSourceIno: bigint]): void;
+    renameReplace(...args: NativeTwoPathArgs): void;
+    sha256File(fd: number, maxBytes?: number, signal?: AbortSignal): Promise<NativeFileHash>;
+}
+export declare function captureNativeFdClose(binding: NativeBinding): (fd: number) => void;
+export {};

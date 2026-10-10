@@ -54,6 +54,27 @@ jobs:
         with:
           node-version: 24
 
+      - name: Cache pnpm store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\pnpm\store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Cache build outputs (incremental)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # `build-all` is content-signature based: it compares each step's inputs
+          # against .artifacts/build-all-cache/*/stamp.json and only recompiles the
+          # steps whose sources actually changed. Persisting this directory turns a
+          # ~35 min cold build into a few minutes for a one-file edit.
+          path: .artifacts/build-all-cache
+          key: build-all-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
+          restore-keys: |
+            build-all-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+            build-all-${{ runner.os }}-
+
       - name: Install dependencies
         shell: bash
         run: |

@@ -1,0 +1,2534 @@
+import { execFile, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants, readFileSync } from "node:fs";
+import fs, {} from "node:fs/promises";
+import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { setTimeout as delay } from "node:timers/promises";
+import { promisify } from "node:util";
+import { applyOwnerOnlyWindowsDirectoryAcl as applyOwnerOnlyWindowsDirectoryAclByHandle, createOwnerOnlyWindowsDirectoryAncestry as createOwnerOnlyWindowsDirectoryAncestryByHandle, } from "../platform/windows-acl.js";
+const execFileAsync = promisify(execFile);
+const WINDOWS_ACL_COMMAND_TIMEOUT_MS = 15_000;
+const WINDOWS_CREATE_OWNER_ONLY_FILE_SCRIPT = String.raw `
+$ErrorActionPreference = "Stop"
+$filePath = $env:CRABLINE_PRIVATE_FILE_PATH
+if ([string]::IsNullOrWhiteSpace($filePath)) {
+  throw "CRABLINE_PRIVATE_FILE_PATH is required."
+}
+
+Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class CrablinePrivateFileIdentity
+{
+    private const int FileInternalInformationClass = 6;
+    private const int FileFsVolumeInformationClass = 1;
+    private const int FileDispositionInfoClass = 4;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoStatusBlock
+    {
+        public IntPtr Status;
+        public UIntPtr Information;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileInternalInformation
+    {
+        public long IndexNumber;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileDispositionInfo
+    {
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool DeleteFile;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationFile(
+        SafeFileHandle file,
+        out IoStatusBlock ioStatus,
+        out FileInternalInformation fileInformation,
+        uint length,
+        int fileInformationClass
+    );
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryVolumeInformationFile(
+        SafeFileHandle file,
+        out IoStatusBlock ioStatus,
+        [Out] byte[] volumeInformation,
+        uint length,
+        int volumeInformationClass
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(
+        SafeFileHandle file,
+        int informationClass,
+        ref FileDispositionInfo information,
+        uint bufferSize
+    );
+
+    [DllImport("ntdll.dll")]
+    private static extern uint RtlNtStatusToDosError(int status);
+
+    private static void ThrowIfFailed(int status)
+    {
+        if (status != 0) {
+            throw new Win32Exception(
+                unchecked((int)RtlNtStatusToDosError(status))
+            );
+        }
+    }
+
+    public static string Read(SafeFileHandle file)
+    {
+        IoStatusBlock ioStatus;
+        FileInternalInformation fileInfo;
+        int status = NtQueryInformationFile(
+            file,
+            out ioStatus,
+            out fileInfo,
+            (uint)Marshal.SizeOf(typeof(FileInternalInformation)),
+            FileInternalInformationClass
+        );
+        ThrowIfFailed(status);
+
+        byte[] volumeInfo = new byte[1024];
+        status = NtQueryVolumeInformationFile(
+            file,
+            out ioStatus,
+            volumeInfo,
+            (uint)volumeInfo.Length,
+            FileFsVolumeInformationClass
+        );
+        ThrowIfFailed(status);
+
+        uint device = BitConverter.ToUInt32(volumeInfo, 8);
+        ulong inode = unchecked((ulong)fileInfo.IndexNumber);
+        return device.ToString(
+            System.Globalization.CultureInfo.InvariantCulture
+        ) + ":" + inode.ToString(
+            System.Globalization.CultureInfo.InvariantCulture
+        );
+    }
+
+    public static void MarkDelete(SafeFileHandle file)
+    {
+        FileDispositionInfo disposition = new FileDispositionInfo {
+            DeleteFile = true
+        };
+        if (!SetFileInformationByHandle(
+            file,
+            FileDispositionInfoClass,
+            ref disposition,
+            (uint)Marshal.SizeOf(typeof(FileDispositionInfo))
+        )) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+}
+"@
+
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
+if ($null -eq $sid) {
+  throw "Could not resolve the current Windows user SID."
+}
+
+$acl = [System.Security.AccessControl.FileSecurity]::new()
+$acl.SetOwner($sid)
+$acl.SetAccessRuleProtection($true, $false)
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+  $sid,
+  [System.Security.AccessControl.FileSystemRights]::FullControl,
+  [System.Security.AccessControl.AccessControlType]::Allow
+)
+$acl.SetAccessRule($rule)
+
+$rights = (
+  [System.Security.AccessControl.FileSystemRights]::Read -bor
+  [System.Security.AccessControl.FileSystemRights]::Write -bor
+  [System.Security.AccessControl.FileSystemRights]::ReadPermissions -bor
+  [System.Security.AccessControl.FileSystemRights]::Delete
+)
+$stream = [System.IO.FileStream]::new(
+  $filePath,
+  [System.IO.FileMode]::CreateNew,
+  $rights,
+  [System.IO.FileShare]::ReadWrite,
+  4096,
+  [System.IO.FileOptions]::None,
+  $acl
+)
+try {
+  $actual = $stream.GetAccessControl()
+  $ownerSid = $actual.GetOwner([System.Security.Principal.SecurityIdentifier])
+  $rules = @($actual.GetAccessRules(
+    $true,
+    $true,
+    [System.Security.Principal.SecurityIdentifier]
+  ))
+  if (-not $actual.AreAccessRulesProtected) {
+    throw "Private file DACL still inherits permissions."
+  }
+  if ($ownerSid.Value -ne $sid.Value) {
+    throw "Private file owner SID does not match the current user."
+  }
+  if ($rules.Count -ne 1) {
+    throw "Private file DACL must contain exactly one access rule."
+  }
+  $actualRule = $rules[0]
+  if (
+    $actualRule.IsInherited -or
+    $actualRule.IdentityReference.Value -ne $sid.Value -or
+    $actualRule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+    (($actualRule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl)
+  ) {
+    throw "Private file DACL is not owner-only full control."
+  }
+  [Console]::Out.Write(
+    [CrablinePrivateFileIdentity]::Read($stream.SafeFileHandle)
+  )
+} catch {
+  $primaryError = $_.Exception
+  try {
+    [CrablinePrivateFileIdentity]::MarkDelete($stream.SafeFileHandle)
+  } catch {
+    $aggregateErrors = [System.Collections.Generic.List[System.Exception]]::new()
+    $aggregateErrors.Add($primaryError)
+    $aggregateErrors.Add($_.Exception)
+    throw [System.AggregateException]::new(
+      "Private file creation and handle-bound cleanup failed.",
+      $aggregateErrors
+    )
+  }
+  throw $primaryError
+} finally {
+  $stream.Dispose()
+}
+`;
+const WINDOWS_VERIFY_OWNER_ONLY_DIRECTORY_ACL_SCRIPT = String.raw `
+$ErrorActionPreference = "Stop"
+$directoryPath = $env:CRABLINE_PRIVATE_DIRECTORY_PATH
+if ([string]::IsNullOrWhiteSpace($directoryPath)) {
+  throw "CRABLINE_PRIVATE_DIRECTORY_PATH is required."
+}
+
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
+if ($null -eq $sid) {
+  throw "Could not resolve the current Windows user SID."
+}
+
+$actual = Get-Acl -LiteralPath $directoryPath
+$ownerSid = $actual.GetOwner([System.Security.Principal.SecurityIdentifier])
+$rules = @($actual.GetAccessRules(
+  $true,
+  $true,
+  [System.Security.Principal.SecurityIdentifier]
+))
+$requiredInheritance = (
+  [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+  [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+)
+if (-not $actual.AreAccessRulesProtected) {
+  throw "Private directory DACL still inherits permissions."
+}
+if ($ownerSid.Value -ne $sid.Value) {
+  throw "Private directory owner SID does not match the current user."
+}
+if ($rules.Count -ne 1) {
+  throw "Private directory DACL must contain exactly one access rule."
+}
+$actualRule = $rules[0]
+if (
+  $actualRule.IsInherited -or
+  $actualRule.IdentityReference.Value -ne $sid.Value -or
+  $actualRule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+  (($actualRule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) -or
+  (($actualRule.InheritanceFlags -band $requiredInheritance) -ne $requiredInheritance)
+) {
+  throw "Private directory DACL is not owner-only inheritable full control."
+}
+`;
+const WINDOWS_VERIFY_OWNER_ONLY_FILE_ACL_SCRIPT = String.raw `
+$ErrorActionPreference = "Stop"
+$filePath = $env:CRABLINE_PRIVATE_FILE_PATH
+if ([string]::IsNullOrWhiteSpace($filePath)) {
+  throw "CRABLINE_PRIVATE_FILE_PATH is required."
+}
+
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
+if ($null -eq $sid) {
+  throw "Could not resolve the current Windows user SID."
+}
+
+$actual = Get-Acl -LiteralPath $filePath
+$ownerSid = $actual.GetOwner([System.Security.Principal.SecurityIdentifier])
+$rules = @($actual.GetAccessRules(
+  $true,
+  $true,
+  [System.Security.Principal.SecurityIdentifier]
+))
+if (-not $actual.AreAccessRulesProtected) {
+  throw "Private file DACL still inherits permissions."
+}
+if ($ownerSid.Value -ne $sid.Value) {
+  throw "Private file owner SID does not match the current user."
+}
+if ($rules.Count -ne 1) {
+  throw "Private file DACL must contain exactly one access rule."
+}
+$actualRule = $rules[0]
+if (
+  $actualRule.IsInherited -or
+  $actualRule.IdentityReference.Value -ne $sid.Value -or
+  $actualRule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+  (($actualRule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl)
+) {
+  throw "Private file DACL is not owner-only full control."
+}
+`;
+const WINDOWS_VERIFY_SAFE_DIRECTORY_ENTRY_PARENT_SCRIPT = String.raw `
+$ErrorActionPreference = "Stop"
+$directoryPath = $env:CRABLINE_PRIVATE_DIRECTORY_PATH
+if ([string]::IsNullOrWhiteSpace($directoryPath)) {
+  throw "CRABLINE_PRIVATE_DIRECTORY_PATH is required."
+}
+
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
+if ($null -eq $sid) {
+  throw "Could not resolve the current Windows user SID."
+}
+
+$trustedSids = @(
+  $sid.Value,
+  "S-1-5-18",
+  "S-1-5-32-544",
+  "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
+$ancestorReplacementRights = (
+  [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+  [System.Security.AccessControl.FileSystemRights]::Delete -bor
+  [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+  [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+)
+$ancestorReplacementMask = [BitConverter]::ToUInt32(
+  [BitConverter]::GetBytes([int32]$ancestorReplacementRights),
+  0
+)
+$genericAll = [uint32]0x10000000
+$inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
+
+$actual = Get-Acl -LiteralPath $directoryPath
+$rawDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new(
+  $actual.GetSecurityDescriptorBinaryForm(),
+  0
+)
+if (
+  (($rawDescriptor.ControlFlags -band
+    [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0) -or
+  $null -eq $rawDescriptor.DiscretionaryAcl
+) {
+  throw "Directory has an absent or null DACL in private mutation ancestry."
+}
+$ownerSid = $actual.GetOwner([System.Security.Principal.SecurityIdentifier])
+if ($trustedSids -notcontains $ownerSid.Value) {
+  throw "Directory owner is not trusted for private mutation ancestry."
+}
+$rules = @($actual.GetAccessRules(
+  $true,
+  $true,
+  [System.Security.Principal.SecurityIdentifier]
+))
+foreach ($rule in $rules) {
+  $ruleAccessMask = [BitConverter]::ToUInt32(
+    [BitConverter]::GetBytes([int32]$rule.FileSystemRights),
+    0
+  )
+  $appliesToDirectory = ($rule.PropagationFlags -band $inheritOnly) -eq 0
+  if (
+    $appliesToDirectory -and
+    $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+    $trustedSids -notcontains $rule.IdentityReference.Value -and
+    ($ruleAccessMask -band ($ancestorReplacementMask -bor $genericAll)) -ne 0
+  ) {
+    throw "Directory grants child-deletion rights to an untrusted principal."
+  }
+}
+`;
+const WINDOWS_VERIFY_SAFE_DIRECTORY_MUTATION_BOUNDARY_SCRIPT = String.raw `
+$ErrorActionPreference = "Stop"
+$directoryPath = $env:CRABLINE_PRIVATE_DIRECTORY_PATH
+if ([string]::IsNullOrWhiteSpace($directoryPath)) {
+  throw "CRABLINE_PRIVATE_DIRECTORY_PATH is required."
+}
+
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
+if ($null -eq $sid) {
+  throw "Could not resolve the current Windows user SID."
+}
+
+$trustedSids = @(
+  $sid.Value,
+  "S-1-5-18",
+  "S-1-5-32-544",
+  "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
+$mutationRights = (
+  [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+  [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+  [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+  [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+  [System.Security.AccessControl.FileSystemRights]::Delete -bor
+  [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+  [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+  [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+)
+$genericMutationRights = [uint32]0x50000000
+$inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
+$mutationAccessMask = [BitConverter]::ToUInt32(
+  [BitConverter]::GetBytes([int32]$mutationRights),
+  0
+)
+
+$actual = Get-Acl -LiteralPath $directoryPath
+$rawDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new(
+  $actual.GetSecurityDescriptorBinaryForm(),
+  0
+)
+if (
+  (($rawDescriptor.ControlFlags -band
+    [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0) -or
+  $null -eq $rawDescriptor.DiscretionaryAcl
+) {
+  throw "Directory has an absent or null DACL in private mutation ancestry."
+}
+$ownerSid = $actual.GetOwner([System.Security.Principal.SecurityIdentifier])
+if ($trustedSids -notcontains $ownerSid.Value) {
+  throw "Directory owner is not trusted for private mutation ancestry."
+}
+$rules = @($actual.GetAccessRules(
+  $true,
+  $true,
+  [System.Security.Principal.SecurityIdentifier]
+))
+foreach ($rule in $rules) {
+  $ruleAccessMask = [BitConverter]::ToUInt32(
+    [BitConverter]::GetBytes([int32]$rule.FileSystemRights),
+    0
+  )
+  $appliesToDirectory = ($rule.PropagationFlags -band $inheritOnly) -eq 0
+  if (
+    $appliesToDirectory -and
+    $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+    $trustedSids -notcontains $rule.IdentityReference.Value -and
+    ($ruleAccessMask -band ($mutationAccessMask -bor $genericMutationRights)) -ne 0
+  ) {
+    throw "Directory grants mutation rights to an untrusted principal."
+  }
+}
+`;
+const runWindowsAclCommand = async (command, args, options) => {
+    const result = await execFileAsync(command, args, { ...options, encoding: "utf8" });
+    return result.stdout;
+};
+export function resolveWindowsPowerShellPath(systemRoot) {
+    const normalizedRoot = systemRoot?.trim() ? path.win32.normalize(systemRoot.trim()) : undefined;
+    if (!normalizedRoot || !/^[A-Za-z]:\\/.test(normalizedRoot)) {
+        throw new Error("SystemRoot must be an absolute local Windows path.");
+    }
+    return path.win32.join(normalizedRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+export async function createOwnerOnlyWindowsFile(filePath, run = runWindowsAclCommand, systemRoot = process.env.SystemRoot) {
+    try {
+        const powershellPath = resolveWindowsPowerShellPath(systemRoot);
+        const output = await run(powershellPath, [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_CREATE_OWNER_ONLY_FILE_SCRIPT,
+        ], {
+            env: {
+                ...process.env,
+                CRABLINE_PRIVATE_FILE_PATH: path.resolve(filePath),
+            },
+            killSignal: "SIGKILL",
+            timeout: WINDOWS_ACL_COMMAND_TIMEOUT_MS,
+            windowsHide: true,
+        });
+        const match = /^(\d+):(\d+)$/u.exec(output.trim());
+        if (!match) {
+            throw new Error("Windows did not return a stable private file identity.");
+        }
+        const identity = {
+            device: BigInt(match[1]),
+            inode: BigInt(match[2]),
+        };
+        if (identity.inode <= 0n) {
+            throw new Error("Windows did not return a stable private file identity.");
+        }
+        return identity;
+    }
+    catch (error) {
+        throw new Error("Could not atomically create and verify an owner-only Windows private file; Windows PowerShell ACL support is required.", { cause: error });
+    }
+}
+export async function applyOwnerOnlyWindowsDirectoryAcl(directoryPath, run = runWindowsAclCommand, systemRoot = process.env.SystemRoot) {
+    await applyOwnerOnlyWindowsDirectoryAclByHandle(directoryPath, run, systemRoot);
+}
+export async function createOwnerOnlyWindowsDirectoryAncestry(directoryPath, run = runWindowsAclCommand, systemRoot = process.env.SystemRoot) {
+    try {
+        return await createOwnerOnlyWindowsDirectoryAncestryByHandle(directoryPath, run, systemRoot);
+    }
+    catch (error) {
+        throw new Error("Could not atomically create and verify owner-only Windows private directory ancestry; Windows PowerShell security descriptor support is required.", { cause: error });
+    }
+}
+export async function verifyOwnerOnlyWindowsDirectoryAcl(directoryPath, run = runWindowsAclCommand, systemRoot = process.env.SystemRoot) {
+    try {
+        const powershellPath = resolveWindowsPowerShellPath(systemRoot);
+        await run(powershellPath, [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VERIFY_OWNER_ONLY_DIRECTORY_ACL_SCRIPT,
+        ], {
+            env: {
+                ...process.env,
+                CRABLINE_PRIVATE_DIRECTORY_PATH: path.resolve(directoryPath),
+            },
+            killSignal: "SIGKILL",
+            timeout: WINDOWS_ACL_COMMAND_TIMEOUT_MS,
+            windowsHide: true,
+        });
+    }
+    catch (error) {
+        throw new Error("Private mutation parent must have an owner-only protected Windows ACL.", {
+            cause: error,
+        });
+    }
+}
+export async function verifyOwnerOnlyWindowsFileAcl(filePath, run = runWindowsAclCommand, systemRoot = process.env.SystemRoot) {
+    try {
+        const powershellPath = resolveWindowsPowerShellPath(systemRoot);
+        await run(powershellPath, [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VERIFY_OWNER_ONLY_FILE_ACL_SCRIPT,
+        ], {
+            env: {
+                ...process.env,
+                CRABLINE_PRIVATE_FILE_PATH: path.resolve(filePath),
+            },
+            killSignal: "SIGKILL",
+            timeout: WINDOWS_ACL_COMMAND_TIMEOUT_MS,
+            windowsHide: true,
+        });
+    }
+    catch (error) {
+        throw new Error("Private mutation claim must have an owner-only protected Windows ACL.", {
+            cause: error,
+        });
+    }
+}
+export async function verifySafeWindowsDirectoryEntryParent(directoryPath, run = runWindowsAclCommand, systemRoot = process.env.SystemRoot) {
+    try {
+        const powershellPath = resolveWindowsPowerShellPath(systemRoot);
+        await run(powershellPath, [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VERIFY_SAFE_DIRECTORY_ENTRY_PARENT_SCRIPT,
+        ], {
+            env: {
+                ...process.env,
+                CRABLINE_PRIVATE_DIRECTORY_PATH: path.resolve(directoryPath),
+            },
+            killSignal: "SIGKILL",
+            timeout: WINDOWS_ACL_COMMAND_TIMEOUT_MS,
+            windowsHide: true,
+        });
+    }
+    catch (error) {
+        throw new Error("Private mutation boundary has a replaceable Windows ancestor.", {
+            cause: error,
+        });
+    }
+}
+export async function verifySafeWindowsDirectoryMutationBoundary(directoryPath, run = runWindowsAclCommand, systemRoot = process.env.SystemRoot) {
+    try {
+        const powershellPath = resolveWindowsPowerShellPath(systemRoot);
+        await run(powershellPath, [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VERIFY_SAFE_DIRECTORY_MUTATION_BOUNDARY_SCRIPT,
+        ], {
+            env: {
+                ...process.env,
+                CRABLINE_PRIVATE_DIRECTORY_PATH: path.resolve(directoryPath),
+            },
+            killSignal: "SIGKILL",
+            timeout: WINDOWS_ACL_COMMAND_TIMEOUT_MS,
+            windowsHide: true,
+        });
+    }
+    catch (error) {
+        throw new Error("Private mutation ancestry has an unsafe Windows ACL.", {
+            cause: error,
+        });
+    }
+}
+function assertSameFileIdentity(actual, expected) {
+    if (actual.device !== expected.device || actual.inode !== expected.inode) {
+        throw new Error("Private file path identity changed during publication.");
+    }
+}
+async function readHandleIdentity(handle) {
+    const stats = await handle.stat({ bigint: true });
+    if (stats.ino <= 0n) {
+        throw new Error("The filesystem did not provide a stable private file identity.");
+    }
+    return {
+        device: stats.dev,
+        inode: stats.ino,
+    };
+}
+async function assertPathIdentity(filePath, expected) {
+    try {
+        const stats = await fs.lstat(filePath, { bigint: true });
+        if (stats.isFile() &&
+            stats.nlink === 1n &&
+            stats.dev === expected.device &&
+            stats.ino === expected.inode) {
+            return;
+        }
+    }
+    catch (error) {
+        throw new Error("Private file path identity changed during publication.", { cause: error });
+    }
+    throw new Error("Private file path identity changed during publication.");
+}
+async function pathHasFileIdentity(filePath, expected) {
+    try {
+        const stats = await fs.lstat(filePath, { bigint: true });
+        return (stats.isFile() &&
+            stats.nlink === 1n &&
+            stats.dev === expected.device &&
+            stats.ino === expected.inode);
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return false;
+        }
+        throw error;
+    }
+}
+async function readDirectoryHandleIdentity(handle) {
+    const stats = await handle.stat({ bigint: true });
+    if (!stats.isDirectory() || stats.ino <= 0n) {
+        throw new Error("The filesystem did not provide a stable private directory identity.");
+    }
+    return {
+        device: stats.dev,
+        inode: stats.ino,
+        userId: stats.uid,
+    };
+}
+async function assertDirectoryPathIdentity(directoryPath, expected) {
+    try {
+        const stats = await fs.lstat(directoryPath, { bigint: true });
+        if (stats.isDirectory() && stats.dev === expected.device && stats.ino === expected.inode) {
+            return;
+        }
+    }
+    catch (error) {
+        throw new Error("Private directory path identity changed during publication.", {
+            cause: error,
+        });
+    }
+    throw new Error("Private directory path identity changed during publication.");
+}
+export async function captureDirectoryIdentity(directoryPath) {
+    const handle = await fs.open(directoryPath, "r");
+    try {
+        const identity = await readDirectoryHandleIdentity(handle);
+        const secured = {
+            async assertIdentityAt(currentPath = directoryPath) {
+                await assertDirectoryPathIdentity(currentPath, identity);
+            },
+            directoryPath,
+        };
+        await secured.assertIdentityAt();
+        return secured;
+    }
+    finally {
+        await handle.close();
+    }
+}
+export async function syncParentDirectory(filePath, platform = process.platform) {
+    if (platform === "win32") {
+        return;
+    }
+    const handle = await fs.open(path.dirname(filePath), "r");
+    try {
+        await handle.sync();
+    }
+    finally {
+        await handle.close();
+    }
+}
+async function syncParentAtAccessibleBoundary(filePath, syncParent, platform) {
+    try {
+        await syncParent(filePath, platform);
+        return true;
+    }
+    catch (error) {
+        const code = error.code;
+        if (code === "EACCES" || code === "EPERM") {
+            return false;
+        }
+        throw error;
+    }
+}
+async function syncPathAncestry(filePath, syncParent, platform, firstCreatedDirectory) {
+    const resolvedFilePath = path.resolve(filePath);
+    let currentPath = resolvedFilePath;
+    const syncThroughPath = firstCreatedDirectory === undefined ? undefined : path.resolve(firstCreatedDirectory);
+    for (;;) {
+        const mandatory = syncThroughPath !== undefined || currentPath === resolvedFilePath;
+        if (mandatory) {
+            await syncParent(currentPath, platform);
+        }
+        else if (!(await syncParentAtAccessibleBoundary(currentPath, syncParent, platform))) {
+            return;
+        }
+        if (currentPath === syncThroughPath) {
+            return;
+        }
+        const parentPath = path.dirname(currentPath);
+        if (path.dirname(parentPath) === parentPath) {
+            return;
+        }
+        currentPath = parentPath;
+    }
+}
+// Directory rights from chmod(1); inheritance flags are deliberately not rights.
+const DARWIN_DIRECTORY_ACL_RIGHTS = new Set([
+    "list",
+    "add_file",
+    "search",
+    "delete",
+    "add_subdirectory",
+    "delete_child",
+    "readattr",
+    "writeattr",
+    "readextattr",
+    "writeextattr",
+    "readsecurity",
+    "writesecurity",
+    "chown",
+]);
+async function readDarwinDirectoryAcl(directoryPath) {
+    if (process.platform !== "darwin") {
+        return "none";
+    }
+    const directory = await captureDirectoryIdentity(directoryPath);
+    let output;
+    try {
+        // A literal basename prevents newline-containing paths from impersonating ACEs.
+        const result = await execFileAsync("/bin/ls", ["-lde", "."], {
+            cwd: directoryPath,
+            encoding: "utf8",
+            env: { ...process.env, LC_ALL: "C" },
+            maxBuffer: 64 * 1024,
+        });
+        if (result.stderr.length > 0) {
+            throw new Error("macOS ACL inspection reported a diagnostic.");
+        }
+        output = result.stdout;
+    }
+    catch (error) {
+        throw new Error("Could not verify the private directory macOS ACL.", { cause: error });
+    }
+    await directory.assertIdentityAt();
+    for (const character of output) {
+        const code = character.charCodeAt(0);
+        if ((code < 32 && character !== "\n") || (code >= 127 && code <= 159)) {
+            return "unsafe";
+        }
+    }
+    const [header, ...entries] = output.slice(0, -1).split("\n");
+    const mode = header?.match(/^d[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-]([+@]?) +[1-9]\d* +\S+ +\S+ +\d+ +[A-Z][a-z]{2} +\d{1,2} +(?:\d{2}:\d{2}|\d{4}) +\.$/u);
+    if (!output.endsWith("\n") || !mode) {
+        return "unsafe";
+    }
+    // Extended attributes take precedence over '+' in ls, even when an ACL exists.
+    if (entries.length === 0) {
+        return mode[1] === "+" ? "unsafe" : "none";
+    }
+    if (mode[1] === "") {
+        return "unsafe";
+    }
+    for (const [index, entry] of entries.entries()) {
+        // 'inherited' records origin; unlike *_inherit flags it does not propagate.
+        const ace = entry.match(/^ +(\d+): (?:user|group):\S+ (?:inherited )?deny ([a-z_]+(?:,[a-z_]+)*)$/u);
+        if (!ace ||
+            ace[1] !== String(index) ||
+            !ace[2].split(",").every((right) => DARWIN_DIRECTORY_ACL_RIGHTS.has(right))) {
+            return "unsafe";
+        }
+    }
+    return "nonpropagating-deny";
+}
+async function assertDarwinDirectoryAcl(directoryPath, scope) {
+    const acl = await readDarwinDirectoryAcl(directoryPath);
+    if (acl === "unsafe" || (scope === "private" && acl !== "none")) {
+        throw new Error(scope === "private"
+            ? "Private directory must not have a macOS extended ACL."
+            : "Private mutation ancestry has an unsafe or unverifiable macOS ACL.");
+    }
+}
+async function removeDarwinExtendedAcl(directoryPath) {
+    if (process.platform !== "darwin") {
+        return;
+    }
+    try {
+        await execFileAsync("/bin/chmod", ["-N", directoryPath], {
+            encoding: "utf8",
+            env: { ...process.env, LC_ALL: "C" },
+            maxBuffer: 64 * 1024,
+        });
+    }
+    catch (error) {
+        throw new Error("Could not remove the legacy private directory macOS ACL.", {
+            cause: error,
+        });
+    }
+}
+async function nearestExistingDirectory(directoryPath) {
+    let currentPath = path.resolve(directoryPath);
+    for (;;) {
+        try {
+            const stats = await fs.lstat(currentPath);
+            if (!stats.isDirectory()) {
+                throw new Error("Private directory ancestry contains a non-directory entry.");
+            }
+            return currentPath;
+        }
+        catch (error) {
+            if (error.code !== "ENOENT") {
+                throw error;
+            }
+        }
+        const parentPath = path.dirname(currentPath);
+        if (parentPath === currentPath) {
+            throw new Error("Private directory ancestry has no existing parent.");
+        }
+        currentPath = parentPath;
+    }
+}
+async function assertDarwinCreatedAncestryHasNoExtendedAcl(firstCreatedDirectory, finalDirectory) {
+    if (process.platform !== "darwin" || firstCreatedDirectory === undefined) {
+        return;
+    }
+    const firstCreatedPath = path.resolve(firstCreatedDirectory);
+    let currentPath = path.resolve(finalDirectory);
+    const createdPaths = [];
+    for (;;) {
+        createdPaths.push(currentPath);
+        if (currentPath === firstCreatedPath) {
+            break;
+        }
+        const parentPath = path.dirname(currentPath);
+        if (parentPath === currentPath) {
+            throw new Error("Private directory ancestry creation boundary is invalid.");
+        }
+        currentPath = parentPath;
+    }
+    for (const createdPath of createdPaths.reverse()) {
+        await assertDarwinDirectoryAcl(createdPath, "private");
+    }
+}
+async function captureSingleSafePrivateMutationBoundary(directoryPath, platform, stickyTargetOwnedByCurrentUser) {
+    if (platform === "win32" && process.platform === "win32") {
+        await verifySafeWindowsDirectoryMutationBoundary(directoryPath);
+        return await captureDirectoryIdentity(directoryPath);
+    }
+    const currentUserId = process.geteuid?.();
+    if (currentUserId === undefined || !Number.isSafeInteger(currentUserId) || currentUserId < 0) {
+        throw new Error("Could not resolve the current POSIX user for private mutation.");
+    }
+    const boundary = await captureDirectoryIdentity(directoryPath);
+    const stats = await fs.lstat(directoryPath, { bigint: true });
+    if (!stats.isDirectory()) {
+        throw new Error("Private mutation boundary is not a directory.");
+    }
+    const writableByAnotherPrincipal = (stats.mode & 18n) !== 0n;
+    const trustedOwner = stats.uid === BigInt(currentUserId) || stats.uid === 0n;
+    if (!trustedOwner) {
+        throw new Error("Private mutation boundary is not owned by the current POSIX user or root.");
+    }
+    const protectedByStickyOwnership = trustedOwner && (stats.mode & 512n) !== 0n && stickyTargetOwnedByCurrentUser;
+    if (writableByAnotherPrincipal && !protectedByStickyOwnership) {
+        throw new Error("Private mutation boundary is writable by another POSIX principal.");
+    }
+    await assertDarwinDirectoryAcl(directoryPath, "ancestor");
+    await boundary.assertIdentityAt();
+    return boundary;
+}
+async function captureSafePrivateMutationBoundary(directoryPath, platform, stickyTargetOwnedByCurrentUser) {
+    const resolvedBoundaryPath = path.resolve(directoryPath);
+    const boundary = await captureSingleSafePrivateMutationBoundary(resolvedBoundaryPath, platform, stickyTargetOwnedByCurrentUser);
+    return await capturePrivateMutationPathAncestry(resolvedBoundaryPath, platform, boundary);
+}
+async function capturePrivateMutationPathAncestry(directoryPath, platform, boundary) {
+    const resolvedBoundaryPath = path.resolve(directoryPath);
+    const capturedBoundary = boundary ?? (await captureDirectoryIdentity(resolvedBoundaryPath));
+    const ancestors = [];
+    let childPath = await fs.realpath(resolvedBoundaryPath);
+    for (;;) {
+        const parentPath = path.dirname(childPath);
+        if (parentPath === childPath) {
+            break;
+        }
+        if (platform === "win32" && process.platform === "win32") {
+            await verifySafeWindowsDirectoryEntryParent(parentPath);
+            ancestors.push(await captureDirectoryIdentity(parentPath));
+        }
+        else {
+            const childStats = await fs.lstat(childPath, { bigint: true });
+            const currentUserId = process.geteuid?.();
+            const childOwnedByTrustedPrincipal = currentUserId !== undefined &&
+                (childStats.uid === BigInt(currentUserId) || childStats.uid === 0n);
+            ancestors.push(await captureSingleSafePrivateMutationBoundary(parentPath, platform, childOwnedByTrustedPrincipal));
+        }
+        childPath = parentPath;
+    }
+    return {
+        async assertIdentityAt(currentPath = resolvedBoundaryPath) {
+            for (const ancestor of [...ancestors].reverse()) {
+                await ancestor.assertIdentityAt();
+            }
+            await capturedBoundary.assertIdentityAt(currentPath);
+        },
+        directoryPath: resolvedBoundaryPath,
+    };
+}
+async function captureSafePrivateDirectoryMutationParent(currentPath, platform) {
+    if (platform === "win32" && process.platform === "win32") {
+        return await captureSafePrivateMutationBoundary(path.dirname(currentPath), platform, true);
+    }
+    const currentUserId = process.geteuid?.();
+    const targetStats = await fs.lstat(currentPath, { bigint: true });
+    return await captureSafePrivateMutationBoundary(path.dirname(currentPath), platform, currentUserId !== undefined &&
+        targetStats.isDirectory() &&
+        targetStats.uid === BigInt(currentUserId));
+}
+export async function removeSecuredPrivateDirectory(secured, currentPath = secured.directoryPath, quarantineBaseName = path.basename(currentPath), options = {}) {
+    if (path.basename(quarantineBaseName) !== quarantineBaseName || quarantineBaseName.length === 0) {
+        throw new Error("Private directory quarantine basename is malformed.");
+    }
+    const quarantinePath = path.join(path.dirname(currentPath), `.${quarantineBaseName}.${process.pid}.${randomUUID()}.remove`);
+    const platform = options.platform ?? process.platform;
+    const parent = await captureSafePrivateDirectoryMutationParent(currentPath, platform);
+    const claimParent = {
+        assertIdentityAt: (candidatePath = currentPath) => secured.assertIdentityAt(candidatePath),
+        directoryPath: currentPath,
+    };
+    const claim = await acquirePrivateMutationClaimChain(claimParent, {
+        ...(options.claimRuntime ? { runtime: options.claimRuntime } : {}),
+        ...(options.createWindowsFile ? { createWindowsFile: options.createWindowsFile } : {}),
+        ...(options.platform ? { platform: options.platform } : {}),
+    });
+    let removalFailed = false;
+    let primaryError;
+    try {
+        await parent.assertIdentityAt();
+        await claim.assertOwned();
+        await secured.assertIdentityAt(currentPath);
+        await options.beforeRename?.(currentPath);
+        await parent.assertIdentityAt();
+        await claim.assertOwned();
+        await secured.assertIdentityAt(currentPath);
+        await fs.rename(currentPath, quarantinePath);
+        await parent.assertIdentityAt();
+        await secured.assertIdentityAt(quarantinePath);
+        await claim.relocateParent(quarantinePath);
+        await claim.assertOwned();
+        const syncParent = options.syncParent ?? syncParentDirectory;
+        await syncParent(quarantinePath, options.platform);
+        await options.beforeRecursiveRemove?.(quarantinePath);
+        await parent.assertIdentityAt();
+        await claim.assertOwned();
+        await secured.assertIdentityAt(quarantinePath);
+        await claim.prepareContainerRemoval();
+        await (options.removeDirectory ??
+            ((candidatePath) => fs.rm(candidatePath, { force: true, recursive: true })))(quarantinePath);
+        await claim.completeContainerRemoval();
+        await parent.assertIdentityAt();
+        await syncParent(quarantinePath, options.platform);
+    }
+    catch (error) {
+        removalFailed = true;
+        primaryError = error;
+    }
+    try {
+        await claim.release();
+    }
+    catch (releaseError) {
+        if (removalFailed) {
+            const aggregateError = new AggregateError([primaryError, releaseError], "Private directory removal failed and its mutation claim could not be released.");
+            aggregateError.cause = primaryError;
+            throw aggregateError;
+        }
+        throw releaseError;
+    }
+    if (removalFailed) {
+        throw primaryError;
+    }
+}
+export async function securePrivateDirectory(directoryPath, options = {}) {
+    const platform = options.platform ?? process.platform;
+    let created = false;
+    let createdAtomically = false;
+    if (platform === "win32") {
+        try {
+            await fs.lstat(directoryPath);
+        }
+        catch (error) {
+            if (error.code !== "ENOENT") {
+                throw error;
+            }
+            const createWindowsDirectories = options.createWindowsDirectories ??
+                (process.platform === "win32" || options.secureWindowsDirectory === undefined
+                    ? createOwnerOnlyWindowsDirectoryAncestry
+                    : async (candidatePath) => {
+                        await fs.mkdir(candidatePath);
+                        return candidatePath;
+                    });
+            const firstCreatedDirectory = await createWindowsDirectories(directoryPath);
+            if (firstCreatedDirectory === undefined) {
+                throw new Error("Windows private directory creation did not create the requested path.", {
+                    cause: error,
+                });
+            }
+            created = true;
+            createdAtomically =
+                options.createWindowsDirectories !== undefined || process.platform === "win32";
+        }
+    }
+    else {
+        let existed = false;
+        try {
+            await fs.lstat(directoryPath);
+            existed = true;
+        }
+        catch (error) {
+            if (error.code !== "ENOENT") {
+                throw error;
+            }
+        }
+        if (!existed) {
+            await assertDarwinDirectoryAcl(path.dirname(directoryPath), "ancestor");
+        }
+        try {
+            await fs.mkdir(directoryPath, { mode: 0o700 });
+            created = true;
+        }
+        catch (error) {
+            if (error.code !== "EEXIST") {
+                throw error;
+            }
+        }
+    }
+    const handle = await fs.open(directoryPath, "r");
+    let handleOpen = true;
+    const closeHandle = async () => {
+        if (!handleOpen) {
+            return;
+        }
+        handleOpen = false;
+        await handle.close();
+    };
+    let identity;
+    try {
+        identity = await readDirectoryHandleIdentity(handle);
+    }
+    catch (error) {
+        try {
+            await closeHandle();
+        }
+        catch (closeError) {
+            const aggregateError = new AggregateError([error, closeError], "Private directory identity verification failed and its handle could not be closed.");
+            aggregateError.cause = error;
+            throw aggregateError;
+        }
+        throw error;
+    }
+    const secured = {
+        async assertIdentityAt(currentPath = directoryPath) {
+            await assertDirectoryPathIdentity(currentPath, identity);
+        },
+        directoryPath,
+    };
+    try {
+        await secured.assertIdentityAt();
+        if (platform === "win32") {
+            if (!createdAtomically) {
+                await (options.secureWindowsDirectory ?? applyOwnerOnlyWindowsDirectoryAcl)(directoryPath);
+            }
+            if (process.platform !== "win32") {
+                await handle.chmod(0o700);
+            }
+        }
+        else {
+            const currentUserId = options.currentUserId ?? process.geteuid?.();
+            if (currentUserId === undefined ||
+                !Number.isSafeInteger(currentUserId) ||
+                currentUserId < 0 ||
+                identity.userId !== BigInt(currentUserId)) {
+                throw new Error("Private directory must be owned by the current POSIX user.");
+            }
+            if (!created) {
+                await removeDarwinExtendedAcl(directoryPath);
+            }
+            const currentStats = await handle.stat({ bigint: true });
+            const mutationRootMode = options.markMutationRoot === false ? currentStats.mode & 512n : 512n;
+            await handle.chmod(Number(448n | mutationRootMode));
+            await assertDarwinDirectoryAcl(directoryPath, "private");
+            await (options.syncDirectory ?? (() => handle.sync()))();
+        }
+        await secured.assertIdentityAt();
+        const syncParent = options.syncParent ?? syncParentDirectory;
+        if (created) {
+            await syncParent(directoryPath, options.platform);
+        }
+        else {
+            await syncParentAtAccessibleBoundary(directoryPath, syncParent, options.platform);
+        }
+    }
+    catch (error) {
+        let primaryError = error;
+        try {
+            await closeHandle();
+        }
+        catch (closeError) {
+            const aggregateError = new AggregateError([error, closeError], "Private directory securing failed and its verification handle could not be closed.");
+            aggregateError.cause = error;
+            primaryError = aggregateError;
+        }
+        if (created) {
+            try {
+                await removeSecuredPrivateDirectory(secured);
+            }
+            catch (cleanupError) {
+                const aggregateError = new AggregateError([primaryError, cleanupError], `Private directory securing failed and rollback cleanup also failed: ${error instanceof Error ? error.message : String(error)}`);
+                aggregateError.cause = primaryError;
+                throw aggregateError;
+            }
+        }
+        throw primaryError;
+    }
+    finally {
+        await closeHandle();
+    }
+    return secured;
+}
+const PRIVATE_MUTATION_CLAIM_ROOT_FILE = ".crabline-private-mutation.claim";
+const PRIVATE_MUTATION_CLAIM_OWNER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const PRIVATE_MUTATION_CLAIM_METADATA_MAX_BYTES = 4096;
+const PRIVATE_MUTATION_RESERVED_BASENAME_PATTERN = /^\.crabline-private-mutation(?:\.|$)/iu;
+const PRIVATE_MUTATION_CLAIM_WAIT_TIMEOUT_MS = 60_000;
+const PRIVATE_MUTATION_CLAIM_RETRY_DELAY_MS = 50;
+function preparePrivateMutationClaimWait(options) {
+    const timeoutMs = options.timeoutMs ?? PRIVATE_MUTATION_CLAIM_WAIT_TIMEOUT_MS;
+    const retryDelayMs = options.retryDelayMs ?? PRIVATE_MUTATION_CLAIM_RETRY_DELAY_MS;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+        throw new Error("Private mutation claim wait timeout must be a non-negative safe integer.");
+    }
+    if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs <= 0) {
+        throw new Error("Private mutation claim retry delay must be a positive safe integer.");
+    }
+    const now = options.now ?? performance.now.bind(performance);
+    const sleep = options.sleep ??
+        ((delayMs, signal) => delay(delayMs, undefined, { signal }));
+    if (typeof now !== "function" || typeof sleep !== "function") {
+        throw new Error("Private mutation claim wait callbacks must be functions.");
+    }
+    if (options.signal !== undefined && typeof options.signal.throwIfAborted !== "function") {
+        throw new Error("Private mutation claim wait signal is invalid.");
+    }
+    options.signal?.throwIfAborted();
+    if (!Number.isFinite(now())) {
+        throw new Error("Private mutation claim wait clock is invalid.");
+    }
+    return {
+        now,
+        retryDelayMs,
+        ...(options.signal ? { signal: options.signal } : {}),
+        sleep,
+        timeoutMs,
+    };
+}
+function assertNotReservedPrivateMutationPath(targetPath) {
+    if (PRIVATE_MUTATION_RESERVED_BASENAME_PATTERN.test(path.basename(targetPath))) {
+        throw new Error("Private path uses Crabline's reserved mutation claim namespace.");
+    }
+}
+function isProcessAlive(pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+        return false;
+    }
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (error) {
+        return error.code === "EPERM";
+    }
+}
+function processIdentityFromLinuxStat(value, bootId) {
+    const normalizedBootId = bootId.trim();
+    if (!/^[0-9a-f-]{16,64}$/iu.test(normalizedBootId)) {
+        return null;
+    }
+    const commandEnd = value.lastIndexOf(") ");
+    if (commandEnd < 0) {
+        return null;
+    }
+    const fields = value
+        .slice(commandEnd + 2)
+        .trim()
+        .split(/\s+/u);
+    const startTicks = fields[19];
+    return startTicks && /^\d+$/u.test(startTicks) ? `linux:${normalizedBootId}:${startTicks}` : null;
+}
+function processIdentityFromDarwin(processDetails, bootTime) {
+    const bootMatch = /\bsec = (\d+), usec = (\d+)\b/u.exec(bootTime);
+    const launchMatch = /^Launch Time:\s*(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3,6}) ([+-])(\d{2})(\d{2})$/mu.exec(processDetails);
+    if (!bootMatch || !launchMatch) {
+        return null;
+    }
+    const [, year, month, day, hour, minute, second, fraction, sign, offsetHour, offsetMinute] = launchMatch;
+    const offsetMs = (Number(offsetHour) * 60 + Number(offsetMinute)) * 60_000 * (sign === "+" ? 1 : -1);
+    const fractionMicros = Number(fraction.padEnd(6, "0"));
+    const utcMilliseconds = Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second), Math.floor(fractionMicros / 1_000)) - offsetMs;
+    if (!Number.isSafeInteger(utcMilliseconds) || utcMilliseconds <= 0) {
+        return null;
+    }
+    const startedAtMicros = BigInt(utcMilliseconds) * 1000n + BigInt(fractionMicros % 1_000);
+    return `darwin:${bootMatch[1]}.${bootMatch[2]}:us:${startedAtMicros}`;
+}
+function getProcessIdentity(pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+        return null;
+    }
+    if (process.platform === "linux") {
+        try {
+            return processIdentityFromLinuxStat(readFileSync(`/proc/${pid}/stat`, "utf8"), readFileSync("/proc/sys/kernel/random/boot_id", "utf8"));
+        }
+        catch {
+            return null;
+        }
+    }
+    if (process.platform === "darwin") {
+        const options = {
+            encoding: "utf8",
+            env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+            maxBuffer: 512 * 1024,
+            timeout: 3_000,
+        };
+        const bootTime = spawnSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], options);
+        const processDetails = spawnSync("/usr/bin/vmmap", ["-summary", String(pid)], options);
+        return bootTime.status === 0 && processDetails.status === 0
+            ? processIdentityFromDarwin(processDetails.stdout, bootTime.stdout)
+            : null;
+    }
+    if (process.platform !== "win32") {
+        return null;
+    }
+    let powershellPath;
+    try {
+        powershellPath = resolveWindowsPowerShellPath(process.env.SystemRoot);
+    }
+    catch {
+        return null;
+    }
+    const result = spawnSync(powershellPath, [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks.ToString()`,
+    ], { encoding: "utf8", timeout: 1_000, windowsHide: true });
+    const ticks = result.status === 0 ? result.stdout.trim() : "";
+    return /^\d+$/u.test(ticks) ? `windows:${ticks}` : null;
+}
+let cachedCurrentProcessIdentity;
+function defaultPrivateMutationClaimRuntime() {
+    if (cachedCurrentProcessIdentity === undefined) {
+        cachedCurrentProcessIdentity = getProcessIdentity(process.pid);
+    }
+    return {
+        getProcessIdentity,
+        isProcessAlive,
+        ownerId: randomUUID(),
+        pid: process.pid,
+        ...(cachedCurrentProcessIdentity ? { processIdentity: cachedCurrentProcessIdentity } : {}),
+        processStartedAtMs: Math.floor(performance.timeOrigin),
+    };
+}
+function parsePrivateMutationClaimOwner(contents) {
+    let owner;
+    try {
+        owner = JSON.parse(contents);
+    }
+    catch (error) {
+        throw new Error("Private path mutation claim owner metadata is malformed.", { cause: error });
+    }
+    if (!Number.isSafeInteger(owner.pid) ||
+        Number(owner.pid) <= 0 ||
+        typeof owner.ownerId !== "string" ||
+        !PRIVATE_MUTATION_CLAIM_OWNER_ID_PATTERN.test(owner.ownerId) ||
+        !Number.isSafeInteger(owner.processStartedAtMs) ||
+        Number(owner.processStartedAtMs) <= 0 ||
+        (owner.processIdentity !== undefined &&
+            (typeof owner.processIdentity !== "string" ||
+                owner.processIdentity.length === 0 ||
+                owner.processIdentity.length > 256))) {
+        throw new Error("Private path mutation claim owner metadata is malformed.");
+    }
+    return owner;
+}
+async function claimPathHasIdentity(claimPath, expected, expectedLinkCount) {
+    try {
+        const stats = await fs.lstat(claimPath, { bigint: true });
+        return (stats.isFile() &&
+            (expectedLinkCount === undefined ? stats.nlink >= 1n : stats.nlink === expectedLinkCount) &&
+            stats.dev === expected.device &&
+            stats.ino === expected.inode);
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return false;
+        }
+        throw new Error("Private path mutation claim identity changed.", { cause: error });
+    }
+}
+async function assertClaimPathIdentity(claimPath, expected, expectedLinkCount) {
+    if (await claimPathHasIdentity(claimPath, expected, expectedLinkCount)) {
+        return;
+    }
+    throw new Error("Private path mutation claim identity changed.");
+}
+function assertOwnerOnlyPosixMutationClaim(stats, kind) {
+    const currentUserId = process.geteuid?.();
+    if (currentUserId === undefined || !Number.isSafeInteger(currentUserId) || currentUserId < 0) {
+        throw new Error("Could not resolve the current POSIX user for private mutation claims.");
+    }
+    if (stats.uid !== BigInt(currentUserId) || (stats.mode & 63n) !== 0n) {
+        throw new Error(`Private mutation claim ${kind} must be owner-only.`);
+    }
+}
+async function readPrivateMutationClaim(claimPath) {
+    let handle;
+    try {
+        handle = await fs.open(claimPath, process.platform === "win32"
+            ? "r"
+            : fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+        const stats = await handle.stat({ bigint: true });
+        if (!stats.isFile() ||
+            stats.ino <= 0n ||
+            stats.size <= 0n ||
+            stats.size > BigInt(PRIVATE_MUTATION_CLAIM_METADATA_MAX_BYTES)) {
+            throw new Error("Private path mutation claim metadata size is invalid.");
+        }
+        if (process.platform === "win32") {
+            await verifyOwnerOnlyWindowsFileAcl(claimPath);
+        }
+        else {
+            assertOwnerOnlyPosixMutationClaim(stats, "file");
+        }
+        const identity = { device: stats.dev, inode: stats.ino };
+        const buffer = Buffer.alloc(Number(stats.size));
+        let offset = 0;
+        while (offset < buffer.length) {
+            const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+            if (bytesRead === 0) {
+                throw new Error("Private path mutation claim metadata was truncated while reading.");
+            }
+            offset += bytesRead;
+        }
+        const finalStats = await handle.stat({ bigint: true });
+        if (process.platform === "win32") {
+            await verifyOwnerOnlyWindowsFileAcl(claimPath);
+        }
+        else {
+            assertOwnerOnlyPosixMutationClaim(finalStats, "file");
+        }
+        if (!finalStats.isFile() ||
+            finalStats.dev !== stats.dev ||
+            finalStats.ino !== stats.ino ||
+            finalStats.size !== stats.size) {
+            throw new Error("Private path mutation claim metadata changed while reading.");
+        }
+        const contents = buffer.toString("utf8");
+        const owner = parsePrivateMutationClaimOwner(contents);
+        // A live owner may release or replace this pathname after our handle opens.
+        // The open handle is safe, but its metadata is no longer the active claim.
+        if (!(await claimPathHasIdentity(claimPath, identity))) {
+            return null;
+        }
+        return { contents, identity, owner };
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return null;
+        }
+        throw error;
+    }
+    finally {
+        await handle?.close();
+    }
+}
+function nextPrivateMutationClaimPath(parentDirectory, ownerContents) {
+    const digest = createHash("sha256").update(ownerContents).digest("hex");
+    return path.join(parentDirectory, `.crabline-private-mutation.${digest}.claim`);
+}
+async function removeStalePrivateMutationClaimAliases(parentDirectory, staleClaims, currentClaimPath) {
+    const staleIdentities = new Set(staleClaims.map(({ identity }) => `${identity.device}:${identity.inode}`));
+    for (const entry of await fs.readdir(parentDirectory)) {
+        if (!PRIVATE_MUTATION_RESERVED_BASENAME_PATTERN.test(entry)) {
+            continue;
+        }
+        const entryPath = path.join(parentDirectory, entry);
+        if (entryPath === currentClaimPath) {
+            continue;
+        }
+        let stats;
+        try {
+            stats = await fs.lstat(entryPath, { bigint: true });
+        }
+        catch (error) {
+            if (error.code === "ENOENT") {
+                continue;
+            }
+            throw error;
+        }
+        if (stats.isFile() && staleIdentities.has(`${stats.dev}:${stats.ino}`)) {
+            await fs.unlink(entryPath);
+        }
+    }
+}
+class UnsupportedPrivateMutationHardLinkError extends Error {
+    constructor(cause) {
+        super("Private mutation claims require a non-hard-link fallback.", { cause });
+    }
+}
+class ActivePrivateMutationClaimError extends Error {
+    constructor(cause) {
+        super("Private path mutation is already claimed.", { cause });
+    }
+}
+function isUnsupportedHardLinkError(error) {
+    const code = error.code;
+    return code === "EPERM" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS";
+}
+async function acquireHardLinkPrivateMutationClaim(parent, options) {
+    const platform = options.platform ?? process.platform;
+    const runtime = options.runtime ?? defaultPrivateMutationClaimRuntime();
+    if (!Number.isSafeInteger(runtime.pid) ||
+        runtime.pid <= 0 ||
+        !PRIVATE_MUTATION_CLAIM_OWNER_ID_PATTERN.test(runtime.ownerId) ||
+        !Number.isSafeInteger(runtime.processStartedAtMs) ||
+        runtime.processStartedAtMs <= 0 ||
+        (runtime.processIdentity !== undefined &&
+            (runtime.processIdentity.length === 0 || runtime.processIdentity.length > 256))) {
+        throw new Error("Private path mutation claim runtime is invalid.");
+    }
+    const ownerContents = `${JSON.stringify({
+        ownerId: runtime.ownerId,
+        pid: runtime.pid,
+        ...(runtime.processIdentity ? { processIdentity: runtime.processIdentity } : {}),
+        processStartedAtMs: runtime.processStartedAtMs,
+    })}\n`;
+    const rootClaimPath = path.join(parent.directoryPath, PRIVATE_MUTATION_CLAIM_ROOT_FILE);
+    const candidatePath = `${rootClaimPath}.${runtime.pid}.${randomUUID()}.candidate`;
+    let handle;
+    let identity;
+    const linkedClaimPaths = new Set();
+    try {
+        if (platform === "win32" && process.platform === "win32") {
+            const createdIdentity = await (options.createWindowsFile ?? createOwnerOnlyWindowsFile)(candidatePath);
+            handle = await fs.open(candidatePath, "r+");
+            identity = await readHandleIdentity(handle);
+            assertSameFileIdentity(identity, createdIdentity);
+        }
+        else {
+            handle = await fs.open(candidatePath, "wx+", 0o600);
+            identity = await readHandleIdentity(handle);
+            await handle.chmod(0o600);
+        }
+        await handle.writeFile(ownerContents, "utf8");
+        await handle.sync();
+        await assertClaimPathIdentity(candidatePath, identity, 1n);
+        let claimPath = rootClaimPath;
+        const visitedClaimPaths = new Set();
+        const staleClaims = [];
+        for (;;) {
+            if (visitedClaimPaths.has(claimPath)) {
+                throw new Error("Private path mutation claim chain contains a cycle.");
+            }
+            visitedClaimPaths.add(claimPath);
+            try {
+                await fs.link(candidatePath, claimPath);
+                linkedClaimPaths.add(claimPath);
+            }
+            catch (error) {
+                if (isUnsupportedHardLinkError(error)) {
+                    throw new UnsupportedPrivateMutationHardLinkError(error);
+                }
+                if (error.code !== "EEXIST") {
+                    throw error;
+                }
+                await parent.assertIdentityAt();
+                const observed = await readPrivateMutationClaim(claimPath);
+                if (observed === null) {
+                    claimPath = rootClaimPath;
+                    visitedClaimPaths.clear();
+                    staleClaims.length = 0;
+                    continue;
+                }
+                if (runtime.isProcessAlive(observed.owner.pid)) {
+                    if (observed.owner.pid === runtime.pid &&
+                        observed.owner.processStartedAtMs === runtime.processStartedAtMs) {
+                        throw new ActivePrivateMutationClaimError(error);
+                    }
+                    else if (observed.owner.pid !== runtime.pid) {
+                        if (observed.owner.processIdentity === undefined) {
+                            throw new ActivePrivateMutationClaimError(error);
+                        }
+                        const actualIdentity = runtime.getProcessIdentity(observed.owner.pid);
+                        if (actualIdentity === null || actualIdentity === observed.owner.processIdentity) {
+                            throw new ActivePrivateMutationClaimError(error);
+                        }
+                    }
+                }
+                const revalidated = await readPrivateMutationClaim(claimPath);
+                if (revalidated === null ||
+                    revalidated.identity.device !== observed.identity.device ||
+                    revalidated.identity.inode !== observed.identity.inode ||
+                    revalidated.contents !== observed.contents) {
+                    claimPath = rootClaimPath;
+                    visitedClaimPaths.clear();
+                    staleClaims.length = 0;
+                    continue;
+                }
+                const duplicateIdentity = staleClaims.find(({ identity: staleIdentity }) => staleIdentity.device === revalidated.identity.device &&
+                    staleIdentity.inode === revalidated.identity.inode);
+                if (duplicateIdentity !== undefined) {
+                    await parent.assertIdentityAt();
+                    await assertClaimPathIdentity(claimPath, revalidated.identity);
+                    await fs.unlink(claimPath);
+                    await syncParentDirectory(claimPath, options.platform);
+                    claimPath = rootClaimPath;
+                    visitedClaimPaths.clear();
+                    staleClaims.length = 0;
+                    continue;
+                }
+                staleClaims.push({ claimPath, ...revalidated });
+                claimPath = nextPrivateMutationClaimPath(parent.directoryPath, revalidated.contents);
+                continue;
+            }
+            await assertClaimPathIdentity(candidatePath, identity, 2n);
+            await assertClaimPathIdentity(claimPath, identity, 2n);
+            if (staleClaims.length > 0) {
+                const staleRoot = await readPrivateMutationClaim(rootClaimPath);
+                const expectedRoot = staleClaims[0];
+                if (staleRoot === null ||
+                    staleRoot.identity.device !== expectedRoot.identity.device ||
+                    staleRoot.identity.inode !== expectedRoot.identity.inode ||
+                    staleRoot.contents !== expectedRoot.contents) {
+                    throw new Error("Private path mutation claim root changed during recovery.");
+                }
+                await fs.rename(candidatePath, rootClaimPath);
+                linkedClaimPaths.add(rootClaimPath);
+                await assertClaimPathIdentity(rootClaimPath, identity, 2n);
+                await assertClaimPathIdentity(claimPath, identity, 2n);
+                await fs.unlink(claimPath);
+                linkedClaimPaths.delete(claimPath);
+                claimPath = rootClaimPath;
+                await assertClaimPathIdentity(claimPath, identity, 1n);
+                await removeStalePrivateMutationClaimAliases(parent.directoryPath, staleClaims, claimPath);
+            }
+            else {
+                await fs.unlink(candidatePath);
+            }
+            await assertClaimPathIdentity(claimPath, identity, 1n);
+            await parent.assertIdentityAt();
+            await syncParentDirectory(claimPath, options.platform);
+            linkedClaimPaths.clear();
+            let released = false;
+            const claimHandle = handle;
+            let claimHandleOpen = true;
+            let ownedClaimPath = claimPath;
+            let ownedParentPath = parent.directoryPath;
+            const claimIdentity = identity;
+            const closeClaimHandle = async () => {
+                if (!claimHandleOpen) {
+                    return;
+                }
+                claimHandleOpen = false;
+                await claimHandle.close();
+            };
+            const assertOwned = async () => {
+                await parent.assertIdentityAt(ownedParentPath);
+                await assertClaimPathIdentity(ownedClaimPath, claimIdentity, 1n);
+                const observed = await readPrivateMutationClaim(ownedClaimPath);
+                if (observed === null ||
+                    observed.identity.device !== claimIdentity.device ||
+                    observed.identity.inode !== claimIdentity.inode ||
+                    observed.contents !== ownerContents) {
+                    throw new Error("Private path mutation claim owner metadata changed.");
+                }
+            };
+            return {
+                assertOwned,
+                async completeContainerRemoval() {
+                    if (released) {
+                        return;
+                    }
+                    let completionError;
+                    try {
+                        await fs.lstat(ownedParentPath);
+                        completionError = new Error("Private directory path still exists after recursive removal.");
+                    }
+                    catch (error) {
+                        if (error.code !== "ENOENT") {
+                            completionError = error;
+                        }
+                    }
+                    try {
+                        await closeClaimHandle();
+                    }
+                    catch (closeError) {
+                        if (completionError !== undefined) {
+                            const aggregateError = new AggregateError([completionError, closeError], "Private directory removal verification failed and its claim handle could not be closed.");
+                            aggregateError.cause = completionError;
+                            throw aggregateError;
+                        }
+                        throw closeError;
+                    }
+                    if (completionError !== undefined) {
+                        throw completionError;
+                    }
+                    released = true;
+                },
+                async prepareContainerRemoval() {
+                    if (released) {
+                        throw new Error("Private path mutation claim has already been released.");
+                    }
+                    await assertOwned();
+                    await closeClaimHandle();
+                    await assertOwned();
+                },
+                async relocateParent(directoryPath) {
+                    if (released) {
+                        throw new Error("Private path mutation claim has already been released.");
+                    }
+                    const relocatedClaimPath = path.join(directoryPath, path.basename(ownedClaimPath));
+                    await parent.assertIdentityAt(directoryPath);
+                    const observed = await readPrivateMutationClaim(relocatedClaimPath);
+                    if (observed === null ||
+                        observed.identity.device !== claimIdentity.device ||
+                        observed.identity.inode !== claimIdentity.inode ||
+                        observed.contents !== ownerContents) {
+                        throw new Error("Private path mutation claim identity changed during relocation.");
+                    }
+                    ownedParentPath = directoryPath;
+                    ownedClaimPath = relocatedClaimPath;
+                },
+                async release() {
+                    if (released) {
+                        return;
+                    }
+                    const releasePath = `${ownedClaimPath}.${randomUUID()}.release`;
+                    let releaseError;
+                    try {
+                        await assertOwned();
+                        await fs.rename(ownedClaimPath, releasePath);
+                        await assertClaimPathIdentity(releasePath, claimIdentity, 1n);
+                        if ((await fs.readFile(releasePath, "utf8")) !== ownerContents) {
+                            throw new Error("Private path mutation claim owner metadata changed.");
+                        }
+                        await fs.unlink(releasePath);
+                        released = true;
+                        await parent.assertIdentityAt(ownedParentPath);
+                        await syncParentDirectory(ownedClaimPath, options.platform);
+                    }
+                    catch (error) {
+                        releaseError = error;
+                    }
+                    try {
+                        await closeClaimHandle();
+                    }
+                    catch (closeError) {
+                        if (releaseError !== undefined) {
+                            const aggregateError = new AggregateError([releaseError, closeError], "Private path mutation claim release failed and its handle could not be closed.");
+                            aggregateError.cause = releaseError;
+                            throw aggregateError;
+                        }
+                        throw closeError;
+                    }
+                    if (releaseError !== undefined) {
+                        throw releaseError;
+                    }
+                },
+            };
+        }
+    }
+    catch (error) {
+        const cleanupErrors = [];
+        if (identity !== undefined) {
+            for (const linkedClaimPath of linkedClaimPaths) {
+                try {
+                    await assertClaimPathIdentity(linkedClaimPath, identity);
+                    await fs.unlink(linkedClaimPath);
+                    await syncParentDirectory(linkedClaimPath, options.platform);
+                }
+                catch (cleanupError) {
+                    cleanupErrors.push(cleanupError);
+                }
+            }
+        }
+        try {
+            await handle?.close();
+        }
+        catch (closeError) {
+            cleanupErrors.push(closeError);
+        }
+        try {
+            await fs.rm(candidatePath, { force: true });
+        }
+        catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+        }
+        if (cleanupErrors.length > 0) {
+            const aggregateError = new AggregateError([error, ...cleanupErrors], "Private path mutation claim acquisition failed and rollback cleanup also failed.");
+            aggregateError.cause = error;
+            throw aggregateError;
+        }
+        throw error;
+    }
+}
+const PRIVATE_MUTATION_DIRECTORY_OWNER_FILE = "owner.json";
+function samePrivateMutationDirectoryClaim(actual, expected) {
+    return (actual.identity.device === expected.identity.device &&
+        actual.identity.inode === expected.identity.inode &&
+        actual.metadata.contents === expected.metadata.contents);
+}
+async function readPrivateMutationDirectoryClaim(claimPath) {
+    let stats;
+    try {
+        stats = await fs.lstat(claimPath, { bigint: true });
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return null;
+        }
+        throw error;
+    }
+    if (!stats.isDirectory() || stats.ino <= 0n) {
+        throw new Error("Private mutation directory claim is malformed.");
+    }
+    if (process.platform === "win32") {
+        await verifyOwnerOnlyWindowsDirectoryAcl(claimPath);
+    }
+    else {
+        assertOwnerOnlyPosixMutationClaim(stats, "directory");
+    }
+    const metadata = await readPrivateMutationClaim(path.join(claimPath, PRIVATE_MUTATION_DIRECTORY_OWNER_FILE));
+    if (metadata === null) {
+        throw new Error("Private mutation directory claim is missing owner metadata.");
+    }
+    const finalStats = await fs.lstat(claimPath, { bigint: true });
+    if (process.platform === "win32") {
+        await verifyOwnerOnlyWindowsDirectoryAcl(claimPath);
+    }
+    else {
+        assertOwnerOnlyPosixMutationClaim(finalStats, "directory");
+    }
+    if (!finalStats.isDirectory() || finalStats.dev !== stats.dev || finalStats.ino !== stats.ino) {
+        throw new Error("Private mutation directory claim identity changed.");
+    }
+    return {
+        identity: { device: stats.dev, inode: stats.ino },
+        metadata,
+    };
+}
+function privateMutationClaimOwnerIsActive(owner, runtime) {
+    if (!runtime.isProcessAlive(owner.pid)) {
+        return false;
+    }
+    if (owner.pid === runtime.pid && owner.processStartedAtMs === runtime.processStartedAtMs) {
+        return true;
+    }
+    if (owner.pid === runtime.pid) {
+        return false;
+    }
+    if (owner.processIdentity === undefined) {
+        return true;
+    }
+    const actualIdentity = runtime.getProcessIdentity(owner.pid);
+    return actualIdentity === null || actualIdentity === owner.processIdentity;
+}
+async function createPrivateMutationClaimDirectory(directoryPath, ownerContents, options) {
+    if (options.platform === "win32" && process.platform === "win32") {
+        const firstCreated = await createOwnerOnlyWindowsDirectoryAncestry(directoryPath);
+        if (firstCreated === undefined) {
+            throw new Error("Windows mutation claim directory creation did not create its path.");
+        }
+    }
+    else {
+        await fs.mkdir(directoryPath, { mode: 0o700 });
+        await fs.chmod(directoryPath, 0o700);
+    }
+    const metadataPath = path.join(directoryPath, PRIVATE_MUTATION_DIRECTORY_OWNER_FILE);
+    let handle;
+    try {
+        if (options.platform === "win32" && process.platform === "win32") {
+            await (options.createWindowsFile ?? createOwnerOnlyWindowsFile)(metadataPath);
+            handle = await fs.open(metadataPath, "r+");
+        }
+        else {
+            handle = await fs.open(metadataPath, "wx+", 0o600);
+            await handle.chmod(0o600);
+        }
+        await handle.writeFile(ownerContents, "utf8");
+        await handle.sync();
+    }
+    finally {
+        await handle?.close();
+    }
+    await syncParentDirectory(metadataPath, options.platform);
+}
+async function removeInstalledPrivateMutationDirectoryClaim(claimPath, expectedIdentity, ownerContents, rootClaimPath, platform) {
+    const observed = await readPrivateMutationDirectoryClaim(claimPath);
+    if (observed === null ||
+        observed.identity.device !== expectedIdentity.device ||
+        observed.identity.inode !== expectedIdentity.inode ||
+        observed.metadata.contents !== ownerContents) {
+        throw new Error("Private mutation directory claim changed before rollback.");
+    }
+    const rollbackPath = `${rootClaimPath}.${randomUUID()}.rollback-dir`;
+    await fs.rename(claimPath, rollbackPath);
+    const moved = await readPrivateMutationDirectoryClaim(rollbackPath);
+    if (moved === null ||
+        moved.identity.device !== expectedIdentity.device ||
+        moved.identity.inode !== expectedIdentity.inode ||
+        moved.metadata.contents !== ownerContents) {
+        throw new Error("Private mutation directory claim changed during rollback.");
+    }
+    await fs.rm(rollbackPath, { force: true, recursive: true });
+    await syncParentDirectory(claimPath, platform);
+}
+async function acquireDirectoryPrivateMutationClaim(parent, options) {
+    const platform = options.platform ?? process.platform;
+    const runtime = options.runtime ?? defaultPrivateMutationClaimRuntime();
+    const ownerContents = `${JSON.stringify({
+        ownerId: runtime.ownerId,
+        pid: runtime.pid,
+        ...(runtime.processIdentity ? { processIdentity: runtime.processIdentity } : {}),
+        processStartedAtMs: runtime.processStartedAtMs,
+    })}\n`;
+    parsePrivateMutationClaimOwner(ownerContents);
+    const rootClaimPath = path.join(parent.directoryPath, PRIVATE_MUTATION_CLAIM_ROOT_FILE);
+    const candidatePath = `${rootClaimPath}.${runtime.pid}.${randomUUID()}.candidate-dir`;
+    const createCandidate = async () => {
+        await createPrivateMutationClaimDirectory(candidatePath, ownerContents, {
+            ...(options.createWindowsFile ? { createWindowsFile: options.createWindowsFile } : {}),
+            platform,
+        });
+        const candidate = await readPrivateMutationDirectoryClaim(candidatePath);
+        if (candidate === null || candidate.metadata.contents !== ownerContents) {
+            throw new Error("Private mutation directory claim candidate could not be verified.");
+        }
+        return candidate;
+    };
+    let candidate;
+    let claimPath = rootClaimPath;
+    let installedClaimPath;
+    let expectedRootClaim;
+    try {
+        candidate = await createCandidate();
+        for (;;) {
+            try {
+                await fs.rename(candidatePath, claimPath);
+                installedClaimPath = claimPath;
+            }
+            catch (error) {
+                const observed = await readPrivateMutationDirectoryClaim(claimPath);
+                if (observed === null) {
+                    throw error;
+                }
+                if (privateMutationClaimOwnerIsActive(observed.metadata.owner, runtime)) {
+                    throw new ActivePrivateMutationClaimError(error);
+                }
+                await parent.assertIdentityAt();
+                const revalidated = await readPrivateMutationDirectoryClaim(claimPath);
+                if (revalidated === null ||
+                    revalidated.identity.device !== observed.identity.device ||
+                    revalidated.identity.inode !== observed.identity.inode ||
+                    revalidated.metadata.contents !== observed.metadata.contents) {
+                    continue;
+                }
+                if (claimPath === rootClaimPath) {
+                    expectedRootClaim = revalidated;
+                }
+                else {
+                    const revalidatedRoot = await readPrivateMutationDirectoryClaim(rootClaimPath);
+                    if (expectedRootClaim === undefined ||
+                        revalidatedRoot === null ||
+                        !samePrivateMutationDirectoryClaim(revalidatedRoot, expectedRootClaim)) {
+                        claimPath = rootClaimPath;
+                        expectedRootClaim = undefined;
+                        continue;
+                    }
+                }
+                claimPath = path.join(claimPath, ".next");
+                continue;
+            }
+            const claimed = await readPrivateMutationDirectoryClaim(claimPath);
+            if (claimed === null ||
+                claimed.identity.device !== candidate.identity.device ||
+                claimed.identity.inode !== candidate.identity.inode ||
+                claimed.metadata.contents !== ownerContents) {
+                throw new Error("Private mutation directory claim ownership could not be verified.");
+            }
+            if (claimPath !== rootClaimPath) {
+                const revalidatedRoot = await readPrivateMutationDirectoryClaim(rootClaimPath);
+                if (expectedRootClaim === undefined ||
+                    revalidatedRoot === null ||
+                    !samePrivateMutationDirectoryClaim(revalidatedRoot, expectedRootClaim)) {
+                    await removeInstalledPrivateMutationDirectoryClaim(claimPath, candidate.identity, ownerContents, rootClaimPath, platform);
+                    installedClaimPath = undefined;
+                    candidate = await createCandidate();
+                    claimPath = rootClaimPath;
+                    expectedRootClaim = undefined;
+                    continue;
+                }
+                const terminalRelativePath = path.relative(rootClaimPath, claimPath);
+                const staleTreePath = `${rootClaimPath}.${randomUUID()}.stale-dir`;
+                await parent.assertIdentityAt();
+                await fs.rename(rootClaimPath, staleTreePath);
+                const relocatedClaimPath = path.join(staleTreePath, terminalRelativePath);
+                installedClaimPath = relocatedClaimPath;
+                const [movedRoot, movedClaim] = await Promise.all([
+                    readPrivateMutationDirectoryClaim(staleTreePath),
+                    readPrivateMutationDirectoryClaim(relocatedClaimPath),
+                ]);
+                if (movedRoot === null ||
+                    !samePrivateMutationDirectoryClaim(movedRoot, revalidatedRoot) ||
+                    movedClaim === null ||
+                    movedClaim.identity.device !== candidate.identity.device ||
+                    movedClaim.identity.inode !== candidate.identity.inode ||
+                    movedClaim.metadata.contents !== ownerContents) {
+                    const compactionError = new Error("Private mutation directory claim changed during compaction.");
+                    try {
+                        await fs.rename(staleTreePath, rootClaimPath);
+                        installedClaimPath = claimPath;
+                    }
+                    catch (rollbackError) {
+                        const aggregateError = new AggregateError([compactionError, rollbackError], "Private mutation directory claim compaction failed and its stale tree could not be restored.");
+                        aggregateError.cause = compactionError;
+                        throw aggregateError;
+                    }
+                    throw compactionError;
+                }
+                try {
+                    await fs.rename(relocatedClaimPath, rootClaimPath);
+                }
+                catch (error) {
+                    const code = error.code;
+                    if (code !== "EEXIST" && code !== "ENOTEMPTY") {
+                        try {
+                            await fs.rename(staleTreePath, rootClaimPath);
+                            installedClaimPath = claimPath;
+                        }
+                        catch (rollbackError) {
+                            const aggregateError = new AggregateError([error, rollbackError], "Private mutation directory claim compaction failed and its stale tree could not be restored.");
+                            aggregateError.cause = error;
+                            throw aggregateError;
+                        }
+                        throw error;
+                    }
+                    const retainedClaim = await readPrivateMutationDirectoryClaim(relocatedClaimPath);
+                    if (retainedClaim === null ||
+                        retainedClaim.identity.device !== candidate.identity.device ||
+                        retainedClaim.identity.inode !== candidate.identity.inode ||
+                        retainedClaim.metadata.contents !== ownerContents) {
+                        throw new Error("Private mutation directory claim changed during compaction.", {
+                            cause: error,
+                        });
+                    }
+                    await fs.rm(staleTreePath, { force: true, recursive: true });
+                    await syncParentDirectory(rootClaimPath, platform);
+                    installedClaimPath = undefined;
+                    candidate = await createCandidate();
+                    claimPath = rootClaimPath;
+                    expectedRootClaim = undefined;
+                    continue;
+                }
+                installedClaimPath = rootClaimPath;
+                const promotedClaim = await readPrivateMutationDirectoryClaim(rootClaimPath);
+                if (promotedClaim === null ||
+                    promotedClaim.identity.device !== candidate.identity.device ||
+                    promotedClaim.identity.inode !== candidate.identity.inode ||
+                    promotedClaim.metadata.contents !== ownerContents) {
+                    throw new Error("Private mutation directory claim changed during compaction.");
+                }
+                await fs.rm(staleTreePath, { force: true, recursive: true });
+                await syncParentDirectory(rootClaimPath, platform);
+                claimPath = rootClaimPath;
+                expectedRootClaim = undefined;
+            }
+            break;
+        }
+        const [rootClaim, claimed] = await Promise.all([
+            readPrivateMutationDirectoryClaim(rootClaimPath),
+            readPrivateMutationDirectoryClaim(claimPath),
+        ]);
+        if (rootClaim === null) {
+            throw new Error("Private mutation directory claim root disappeared.");
+        }
+        if (claimed === null ||
+            claimed.identity.device !== candidate.identity.device ||
+            claimed.identity.inode !== candidate.identity.inode ||
+            claimed.metadata.contents !== ownerContents) {
+            throw new Error("Private mutation directory claim ownership could not be verified.");
+        }
+        if (claimPath !== rootClaimPath &&
+            (expectedRootClaim === undefined ||
+                !samePrivateMutationDirectoryClaim(rootClaim, expectedRootClaim))) {
+            throw new Error("Private mutation directory claim root changed during acquisition.");
+        }
+        const terminalRelativePath = path.relative(rootClaimPath, claimPath);
+        await parent.assertIdentityAt();
+        await syncParentDirectory(claimPath, platform);
+        let released = false;
+        let claimedParentPath = parent.directoryPath;
+        let ownedRootClaimPath = rootClaimPath;
+        let ownedClaimPath = claimPath;
+        const assertOwned = async () => {
+            await parent.assertIdentityAt(claimedParentPath);
+            const [observedRoot, observed] = await Promise.all([
+                readPrivateMutationDirectoryClaim(ownedRootClaimPath),
+                readPrivateMutationDirectoryClaim(ownedClaimPath),
+            ]);
+            if (observedRoot === null ||
+                !samePrivateMutationDirectoryClaim(observedRoot, rootClaim) ||
+                observed === null ||
+                observed.identity.device !== claimed.identity.device ||
+                observed.identity.inode !== claimed.identity.inode ||
+                observed.metadata.contents !== ownerContents) {
+                throw new Error("Private mutation directory claim owner changed.");
+            }
+        };
+        return {
+            assertOwned,
+            async completeContainerRemoval() {
+                if (released) {
+                    return;
+                }
+                try {
+                    await fs.lstat(claimedParentPath);
+                    throw new Error("Private directory path still exists after recursive removal.");
+                }
+                catch (error) {
+                    if (error.code !== "ENOENT") {
+                        throw error;
+                    }
+                }
+                released = true;
+            },
+            async prepareContainerRemoval() {
+                await assertOwned();
+            },
+            async relocateParent(directoryPath) {
+                const relocatedRootClaimPath = path.join(directoryPath, path.basename(ownedRootClaimPath));
+                const relocatedClaimPath = path.join(relocatedRootClaimPath, terminalRelativePath);
+                await parent.assertIdentityAt(directoryPath);
+                const [observedRoot, observed] = await Promise.all([
+                    readPrivateMutationDirectoryClaim(relocatedRootClaimPath),
+                    readPrivateMutationDirectoryClaim(relocatedClaimPath),
+                ]);
+                if (observedRoot === null ||
+                    !samePrivateMutationDirectoryClaim(observedRoot, rootClaim) ||
+                    observed === null ||
+                    observed.identity.device !== claimed.identity.device ||
+                    observed.identity.inode !== claimed.identity.inode ||
+                    observed.metadata.contents !== ownerContents) {
+                    throw new Error("Private mutation directory claim changed during relocation.");
+                }
+                claimedParentPath = directoryPath;
+                ownedRootClaimPath = relocatedRootClaimPath;
+                ownedClaimPath = relocatedClaimPath;
+            },
+            async release() {
+                if (released) {
+                    return;
+                }
+                await assertOwned();
+                const releasePath = `${ownedRootClaimPath}.${randomUUID()}.release-dir`;
+                await fs.rename(ownedRootClaimPath, releasePath);
+                const [movedRoot, moved] = await Promise.all([
+                    readPrivateMutationDirectoryClaim(releasePath),
+                    readPrivateMutationDirectoryClaim(path.join(releasePath, terminalRelativePath)),
+                ]);
+                if (movedRoot === null ||
+                    !samePrivateMutationDirectoryClaim(movedRoot, rootClaim) ||
+                    moved === null ||
+                    moved.identity.device !== claimed.identity.device ||
+                    moved.identity.inode !== claimed.identity.inode ||
+                    moved.metadata.contents !== ownerContents) {
+                    throw new Error("Private mutation directory claim changed during release.");
+                }
+                await fs.rm(releasePath, { force: true, recursive: true });
+                released = true;
+                await parent.assertIdentityAt(claimedParentPath);
+                await syncParentDirectory(ownedRootClaimPath, platform);
+            },
+        };
+    }
+    catch (error) {
+        const cleanupErrors = [];
+        if (installedClaimPath !== undefined && candidate !== undefined) {
+            try {
+                await removeInstalledPrivateMutationDirectoryClaim(installedClaimPath, candidate.identity, ownerContents, rootClaimPath, platform);
+            }
+            catch (cleanupError) {
+                cleanupErrors.push(cleanupError);
+            }
+        }
+        if (cleanupErrors.length > 0) {
+            const aggregateError = new AggregateError([error, ...cleanupErrors], "Private mutation directory claim acquisition failed and rollback cleanup also failed.");
+            aggregateError.cause = error;
+            throw aggregateError;
+        }
+        throw error;
+    }
+    finally {
+        await fs.rm(candidatePath, { force: true, recursive: true });
+    }
+}
+async function acquirePrivateMutationClaim(parent, options) {
+    const rootClaimPath = path.join(parent.directoryPath, PRIVATE_MUTATION_CLAIM_ROOT_FILE);
+    try {
+        const stats = await fs.lstat(rootClaimPath);
+        if (stats.isDirectory()) {
+            return await acquireDirectoryPrivateMutationClaim(parent, options);
+        }
+    }
+    catch (error) {
+        if (error.code !== "ENOENT") {
+            throw error;
+        }
+    }
+    try {
+        return await acquireHardLinkPrivateMutationClaim(parent, options);
+    }
+    catch (error) {
+        let directoryClaimExists = false;
+        try {
+            directoryClaimExists = (await fs.lstat(rootClaimPath)).isDirectory();
+        }
+        catch { }
+        if (!(error instanceof UnsupportedPrivateMutationHardLinkError) && !directoryClaimExists) {
+            throw error;
+        }
+        return await acquireDirectoryPrivateMutationClaim(parent, options);
+    }
+}
+async function captureOwnerOnlyPrivateClaimAncestor(directoryPath, platform) {
+    if (platform === "win32" && process.platform === "win32") {
+        try {
+            await verifyOwnerOnlyWindowsDirectoryAcl(directoryPath);
+        }
+        catch {
+            return null;
+        }
+        return {
+            directory: await captureDirectoryIdentity(directoryPath),
+            mutationRoot: false,
+        };
+    }
+    const currentUserId = process.geteuid?.();
+    if (currentUserId === undefined || !Number.isSafeInteger(currentUserId) || currentUserId < 0) {
+        throw new Error("Could not resolve the current POSIX user for private mutation claims.");
+    }
+    const directory = await captureDirectoryIdentity(directoryPath);
+    const stats = await fs.lstat(directoryPath, { bigint: true });
+    if (!stats.isDirectory()) {
+        throw new Error("Private mutation claim ancestry contains a non-directory entry.");
+    }
+    if (stats.uid !== BigInt(currentUserId) ||
+        (stats.mode & 18n) !== 0n ||
+        (await readDarwinDirectoryAcl(directoryPath)) === "unsafe") {
+        return null;
+    }
+    await directory.assertIdentityAt();
+    return {
+        directory,
+        mutationRoot: (stats.mode & 512n) !== 0n,
+    };
+}
+async function ownerOnlyPrivateClaimAncestry(leaf, platform) {
+    const ancestry = [leaf];
+    let highestMutationRootIndex = platform !== "win32" &&
+        process.platform !== "win32" &&
+        ((await fs.lstat(leaf.directoryPath, { bigint: true })).mode & 512n) !== 0n
+        ? 0
+        : -1;
+    let directoryPath = path.dirname(leaf.directoryPath);
+    while (directoryPath !== path.dirname(directoryPath)) {
+        const ancestor = await captureOwnerOnlyPrivateClaimAncestor(directoryPath, platform);
+        if (ancestor === null) {
+            break;
+        }
+        ancestry.push(ancestor.directory);
+        if (ancestor.mutationRoot) {
+            highestMutationRootIndex = ancestry.length - 1;
+        }
+        directoryPath = path.dirname(directoryPath);
+    }
+    if (platform !== "win32" && process.platform !== "win32") {
+        return highestMutationRootIndex < 0 ? [leaf] : ancestry.slice(0, highestMutationRootIndex + 1);
+    }
+    return ancestry;
+}
+async function acquirePrivateMutationClaimChain(leaf, options) {
+    const platform = options.platform ?? process.platform;
+    const ancestry = await ownerOnlyPrivateClaimAncestry(leaf, platform);
+    const outerBoundary = await captureSafePrivateDirectoryMutationParent(ancestry.at(-1).directoryPath, platform);
+    const claims = [];
+    let leafClaim;
+    try {
+        for (const directory of ancestry) {
+            const claim = await acquirePrivateMutationClaim(directory, options);
+            claims.push(claim);
+            if (directory === leaf) {
+                leafClaim = claim;
+            }
+        }
+    }
+    catch (error) {
+        const cleanupErrors = [];
+        for (const claim of claims.reverse()) {
+            try {
+                await claim.release();
+            }
+            catch (cleanupError) {
+                cleanupErrors.push(cleanupError);
+            }
+        }
+        if (cleanupErrors.length > 0) {
+            const aggregateError = new AggregateError([error, ...cleanupErrors], "Private mutation claim-chain acquisition failed and rollback cleanup also failed.");
+            aggregateError.cause = error;
+            throw aggregateError;
+        }
+        throw error;
+    }
+    let released = false;
+    let leafRemoved = false;
+    const releaseClaims = async (claimsToRelease) => {
+        const releaseErrors = [];
+        for (const claim of claimsToRelease) {
+            try {
+                await claim.release();
+            }
+            catch (error) {
+                releaseErrors.push(error);
+            }
+        }
+        if (releaseErrors.length === 1) {
+            throw releaseErrors[0];
+        }
+        if (releaseErrors.length > 1) {
+            throw new AggregateError(releaseErrors, "Private mutation claim-chain release failed.");
+        }
+    };
+    return {
+        async assertOwned() {
+            await outerBoundary.assertIdentityAt();
+            for (const claim of claims) {
+                await claim.assertOwned();
+            }
+        },
+        async completeContainerRemoval() {
+            if (released) {
+                return;
+            }
+            if (leafClaim === undefined) {
+                throw new Error("Private directory removal did not acquire its leaf mutation claim.");
+            }
+            let primaryError;
+            try {
+                await leafClaim.completeContainerRemoval();
+                leafRemoved = true;
+            }
+            catch (error) {
+                primaryError = error;
+            }
+            try {
+                await releaseClaims(claims.slice(1).reverse());
+            }
+            catch (releaseError) {
+                if (primaryError !== undefined) {
+                    const aggregateError = new AggregateError([primaryError, releaseError], "Private directory removal completion and ancestor claim release both failed.");
+                    aggregateError.cause = primaryError;
+                    throw aggregateError;
+                }
+                throw releaseError;
+            }
+            if (primaryError !== undefined) {
+                throw primaryError;
+            }
+            released = true;
+        },
+        async prepareContainerRemoval() {
+            if (leafClaim === undefined) {
+                throw new Error("Private directory removal did not acquire its leaf mutation claim.");
+            }
+            await leafClaim.prepareContainerRemoval();
+        },
+        async relocateParent(directoryPath) {
+            if (leafClaim === undefined) {
+                throw new Error("Private directory removal did not acquire its leaf mutation claim.");
+            }
+            await leafClaim.relocateParent(directoryPath);
+        },
+        async release() {
+            if (released) {
+                return;
+            }
+            await releaseClaims(leafRemoved ? claims.slice(1).reverse() : [...claims].reverse());
+            released = true;
+        },
+    };
+}
+function privateMutationClaimTimeoutError(timeoutMs, cause) {
+    return Object.assign(new Error(`Timed out after ${timeoutMs}ms waiting for a private mutation claim.`, { cause }), { code: "ETIMEDOUT" });
+}
+async function releaseClaimAfterWaitFailure(claim, error) {
+    try {
+        await claim.release();
+    }
+    catch (releaseError) {
+        const aggregateError = new AggregateError([error, releaseError], "Private mutation claim wait failed and its acquired claim could not be released.");
+        aggregateError.cause = error;
+        throw aggregateError;
+    }
+    throw error;
+}
+async function acquirePrivateMutationClaimWithWait(acquire, wait) {
+    if (wait === undefined) {
+        return await acquire();
+    }
+    const deadlineMs = wait.now() + wait.timeoutMs;
+    let lastContentionError;
+    for (;;) {
+        wait.signal?.throwIfAborted();
+        let claim;
+        try {
+            claim = await acquire();
+        }
+        catch (error) {
+            if (!(error instanceof ActivePrivateMutationClaimError) || wait.timeoutMs === 0) {
+                throw error;
+            }
+            lastContentionError = error;
+            const remainingMs = deadlineMs - wait.now();
+            if (remainingMs <= 0) {
+                throw privateMutationClaimTimeoutError(wait.timeoutMs, error);
+            }
+            await wait.sleep(Math.min(wait.retryDelayMs, remainingMs), wait.signal);
+            continue;
+        }
+        try {
+            wait.signal?.throwIfAborted();
+            if (lastContentionError && wait.now() >= deadlineMs) {
+                throw privateMutationClaimTimeoutError(wait.timeoutMs, lastContentionError);
+            }
+        }
+        catch (error) {
+            return await releaseClaimAfterWaitFailure(claim, error);
+        }
+        return claim;
+    }
+}
+async function secureOwnerOnlyMutationParent(directoryPath) {
+    return await securePrivateDirectory(directoryPath, {
+        markMutationRoot: false,
+        platform: process.platform,
+    });
+}
+export async function publishPrivateFileAtomically(filePath, contents, options = {}) {
+    assertNotReservedPrivateMutationPath(filePath);
+    const claimWait = preparePrivateMutationClaimWait(options.claimWait ?? {});
+    const temporaryPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
+    const parentDirectory = path.resolve(path.dirname(filePath));
+    const platform = options.platform ?? process.platform;
+    let parentExists = false;
+    try {
+        const parentStats = await fs.lstat(parentDirectory);
+        if (!parentStats.isDirectory()) {
+            throw new Error("Private publication parent is not a directory.");
+        }
+        parentExists = true;
+    }
+    catch (error) {
+        if (error.code !== "ENOENT") {
+            throw error;
+        }
+    }
+    const creationBoundary = parentExists
+        ? undefined
+        : await captureSafePrivateMutationBoundary(await nearestExistingDirectory(parentDirectory), platform, true);
+    const migrationBoundary = parentExists
+        ? await capturePrivateMutationPathAncestry(parentDirectory, platform)
+        : undefined;
+    const firstCreatedDirectory = platform === "win32"
+        ? parentExists
+            ? undefined
+            : await (options.createWindowsDirectories ?? createOwnerOnlyWindowsDirectoryAncestry)(parentDirectory)
+        : await fs.mkdir(parentDirectory, { recursive: true, mode: 0o700 });
+    await creationBoundary?.assertIdentityAt();
+    await assertDarwinCreatedAncestryHasNoExtendedAcl(firstCreatedDirectory, parentDirectory);
+    if (firstCreatedDirectory !== undefined && platform !== "win32") {
+        await securePrivateDirectory(firstCreatedDirectory, {
+            markMutationRoot: true,
+            platform,
+        });
+    }
+    await migrationBoundary?.assertIdentityAt();
+    const parent = await secureOwnerOnlyMutationParent(parentDirectory);
+    await migrationBoundary?.assertIdentityAt();
+    const claimOptions = {
+        ...(options.claimRuntime ? { runtime: options.claimRuntime } : {}),
+        ...(options.createWindowsFile ? { createWindowsFile: options.createWindowsFile } : {}),
+        ...(options.platform ? { platform: options.platform } : {}),
+    };
+    // The full ancestry fence stays held for the temporary file's lifetime so supported removals
+    // cannot quarantine a secret. Active publishers wait here without serializing their whole flow.
+    const claim = await acquirePrivateMutationClaimWithWait(() => acquirePrivateMutationClaimChain(parent, claimOptions), claimWait);
+    let handle;
+    let identity;
+    let publicationFailed = false;
+    let primaryError;
+    try {
+        if (platform === "win32" && options.secureWindowsFile === undefined) {
+            const createdIdentity = await (options.createWindowsFile ?? createOwnerOnlyWindowsFile)(temporaryPath);
+            identity = createdIdentity;
+            handle = await fs.open(temporaryPath, "r+");
+            const openedIdentity = await readHandleIdentity(handle);
+            assertSameFileIdentity(openedIdentity, createdIdentity);
+        }
+        else {
+            handle = await fs.open(temporaryPath, "wx+", 0o600);
+            identity = await readHandleIdentity(handle);
+            if (platform === "win32") {
+                await options.secureWindowsFile(temporaryPath);
+            }
+            else {
+                await handle.chmod(0o600);
+            }
+        }
+        await assertPathIdentity(temporaryPath, identity);
+        await handle.writeFile(contents, "utf8");
+        await handle.sync();
+        await assertPathIdentity(temporaryPath, identity);
+        await options.beforeRename?.(temporaryPath);
+        await parent.assertIdentityAt();
+        await claim.assertOwned();
+        await assertPathIdentity(temporaryPath, identity);
+        await options.beforeCommitRename?.(temporaryPath);
+        await parent.assertIdentityAt();
+        await claim.assertOwned();
+        await assertPathIdentity(temporaryPath, identity);
+        // Node has no portable renameat API. The owner-only parent and parent-wide claim chain fence
+        // every supported same-user writer while these path identities are revalidated.
+        await fs.rename(temporaryPath, filePath);
+        await parent.assertIdentityAt();
+        await claim.assertOwned();
+        await syncPathAncestry(filePath, options.syncParent ?? syncParentDirectory, options.platform, firstCreatedDirectory);
+        await options.afterRename?.(filePath);
+        await parent.assertIdentityAt();
+        await claim.assertOwned();
+        await assertPathIdentity(filePath, identity);
+    }
+    catch (error) {
+        publicationFailed = true;
+        primaryError = error;
+    }
+    const cleanupErrors = [];
+    try {
+        await handle?.close();
+    }
+    catch (error) {
+        cleanupErrors.push(error);
+    }
+    try {
+        if (identity !== undefined && (await pathHasFileIdentity(temporaryPath, identity))) {
+            await (options.removeTemporaryFile ??
+                ((candidatePath) => fs.rm(candidatePath, { force: true })))(temporaryPath);
+        }
+    }
+    catch (error) {
+        cleanupErrors.push(error);
+    }
+    try {
+        await claim.release();
+    }
+    catch (error) {
+        cleanupErrors.push(error);
+    }
+    if (publicationFailed) {
+        if (cleanupErrors.length > 0) {
+            const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
+            const aggregateError = new AggregateError([primaryError, ...cleanupErrors], `${primaryMessage} Private temporary file cleanup also failed.`);
+            aggregateError.cause = primaryError;
+            const primaryCode = typeof primaryError === "object" && primaryError !== null
+                ? primaryError.code
+                : undefined;
+            if (primaryCode) {
+                Object.assign(aggregateError, { code: primaryCode });
+            }
+            throw aggregateError;
+        }
+        throw primaryError;
+    }
+    if (cleanupErrors.length === 1) {
+        throw cleanupErrors[0];
+    }
+    if (cleanupErrors.length > 1) {
+        throw new AggregateError(cleanupErrors, "Private temporary file publication cleanup failed.");
+    }
+}
+//# sourceMappingURL=private-file.js.map

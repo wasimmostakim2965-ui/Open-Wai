@@ -1,0 +1,395 @@
+import { CrablineError } from "../core/errors.js";
+import { isMatrixEventId, isMatrixRoomId } from "../matrix-ids.js";
+import { canonicalizeTelegramUsername, TELEGRAM_NATIVE_CHAT_ID_MAX, } from "../servers/telegram-identity.js";
+import { matchesNativeId } from "./native-ids.js";
+import { slackTargetKey, SLACK_SEND_TARGET_ID_RULE, SLACK_TS_RULE } from "./slack-ids.js";
+export const DISCORD_SNOWFLAKE_RULE = {
+    example: "123456789012345678",
+    name: "Discord snowflake id",
+    pattern: /^[1-9]\d{0,19}$/u,
+    validate: (value) => BigInt(value) <= 18446744073709551615n,
+};
+export const FEISHU_CHAT_ID_RULE = {
+    example: "oc_abc123",
+    name: "Feishu chat_id",
+    pattern: /^oc_[A-Za-z0-9_-]+$/u,
+};
+export const FEISHU_MESSAGE_ID_RULE = {
+    example: "om_abc123",
+    name: "Feishu message_id",
+    pattern: /^om_[A-Za-z0-9_-]+$/u,
+};
+export const GOOGLE_CHAT_SPACE_RULE = {
+    example: "spaces/AAAABbbbCCC",
+    name: "Google Chat space name",
+    pattern: /^spaces\/[A-Za-z0-9_-]+$/u,
+};
+export const GOOGLE_CHAT_THREAD_RULE = {
+    example: "spaces/AAAABbbbCCC/threads/BBBBccccDDD",
+    name: "Google Chat thread name",
+    pattern: /^spaces\/[A-Za-z0-9_-]+\/threads\/[A-Za-z0-9_-]+$/u,
+};
+export const IMESSAGE_THREAD_RULE = {
+    example: "+15551234567, user@example.com, or iMessage;-;chat-guid",
+    name: "iMessage recipient or chat GUID",
+    pattern: /^(?:\+[1-9]\d{6,14}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|(?:iMessage|SMS);[+-];.+)$/u,
+};
+export const MATRIX_ROOM_ID_RULE = {
+    example: "!abcdef:matrix.org",
+    name: "Matrix room id",
+    pattern: /^!/u,
+    validate: isMatrixRoomId,
+};
+export const MATRIX_EVENT_ID_RULE = {
+    example: "$eventid:matrix.org",
+    name: "Matrix event id",
+    pattern: /^\$/u,
+    validate: isMatrixEventId,
+};
+export { isMatrixEventId, isMatrixRoomId } from "../matrix-ids.js";
+export const MATTERMOST_ID_RULE = {
+    example: "abcdefghijklmnopqrstuvwx12",
+    name: "Mattermost id",
+    pattern: /^[a-z0-9]{26}$/u,
+};
+export const MSTEAMS_CONVERSATION_ID_RULE = {
+    example: "a:opaque-conversation-id",
+    name: "Microsoft Teams conversation id",
+    pattern: /^.+$/su,
+};
+export const TELEGRAM_CHAT_ID_RULE = {
+    example: "-1001234567890 or @channelusername",
+    name: "Telegram chat id",
+    pattern: /^(?:-?[1-9]\d*|@[A-Za-z][A-Za-z0-9_]{4,31})$/u,
+    validate: (value) => value.startsWith("@") || BigInt(value.replace(/^-/u, "")) <= TELEGRAM_NATIVE_CHAT_ID_MAX,
+};
+export const TELEGRAM_INBOUND_CHAT_ID_RULE = {
+    example: "-1001234567890",
+    name: "Telegram inbound chat id",
+    pattern: /^-?[1-9]\d*$/u,
+    validate: (value) => BigInt(value.replace(/^-/u, "")) <= TELEGRAM_NATIVE_CHAT_ID_MAX,
+};
+export const TELEGRAM_MESSAGE_THREAD_ID_RULE = {
+    example: "42",
+    name: "Telegram message_thread_id",
+    pattern: /^[1-9]\d*$/u,
+    validate: (value) => BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER),
+};
+export const WHATSAPP_WA_ID_RULE = {
+    example: "15551234567",
+    name: "WhatsApp wa_id",
+    pattern: /^\d{7,15}$/u,
+};
+export const ZALO_ID_RULE = {
+    example: "user-1",
+    name: "Zalo string id",
+    pattern: /^\S+$/u,
+};
+export const ZALO_UNSUPPORTED_THREAD_TARGET_ERROR = "Zalo does not support thread targets.";
+export const WHATSAPP_UNSUPPORTED_THREAD_TARGET_ERROR = "WhatsApp does not support thread targets.";
+function requireNativeId(value, rule, label) {
+    if (!matchesNativeId(value, rule)) {
+        throw new CrablineError(`${label} must be a native ${rule.name} such as ${rule.example}.`, {
+            kind: "config",
+        });
+    }
+    return value;
+}
+function createNativeTargetCodec(options) {
+    const channelLabel = options.channelLabel ?? "channelId";
+    const threadLabel = options.threadLabel ?? "threadId";
+    const threadRule = options.thread ?? options.channel;
+    return {
+        normalize(target) {
+            const channelId = requireNativeId(target.channelId ?? target.id, options.channel, channelLabel);
+            const normalized = {
+                channelId,
+                id: target.id,
+                metadata: target.metadata,
+            };
+            if (target.threadId) {
+                normalized.threadId = requireNativeId(target.threadId, threadRule, threadLabel);
+            }
+            return normalized;
+        },
+        resolveThreadId(target) {
+            const normalized = this.normalize(target);
+            return normalized.threadId ?? normalized.channelId ?? normalized.id;
+        },
+    };
+}
+export function createGenericLocalMockTargetCodec(platform) {
+    const prefix = `${platform}:`;
+    const encodeComponent = (value, label) => {
+        try {
+            return encodeURIComponent(value);
+        }
+        catch (error) {
+            throw new CrablineError(`${platform} ${label} cannot be encoded.`, {
+                cause: error,
+                kind: "config",
+            });
+        }
+    };
+    const requireCanonicalComponent = (value, label) => {
+        try {
+            if (!value ||
+                value.includes(":") ||
+                encodeURIComponent(decodeURIComponent(value)) !== value) {
+                throw new Error("non-canonical component");
+            }
+        }
+        catch (error) {
+            throw new CrablineError(`${platform} canonical ${label} is malformed.`, {
+                cause: error,
+                kind: "config",
+            });
+        }
+    };
+    const normalizeChannel = (value) => {
+        if (!value) {
+            throw new CrablineError(`${platform} channelId must not be empty.`, { kind: "config" });
+        }
+        if (!value.startsWith(prefix)) {
+            return `${prefix}${encodeComponent(value, "channelId")}`;
+        }
+        requireCanonicalComponent(value.slice(prefix.length), "channelId");
+        return value;
+    };
+    return {
+        normalize(target) {
+            const channelId = normalizeChannel(target.channelId ?? target.id);
+            const normalized = {
+                channelId,
+                id: target.id,
+                metadata: target.metadata,
+            };
+            if (target.threadId) {
+                if (target.threadId.startsWith(prefix)) {
+                    const canonicalPrefix = `${channelId}:`;
+                    if (!target.threadId.startsWith(canonicalPrefix)) {
+                        throw new CrablineError(`${platform} canonical thread parent must match the target channel.`, { kind: "config" });
+                    }
+                    requireCanonicalComponent(target.threadId.slice(canonicalPrefix.length), "threadId");
+                    normalized.threadId = target.threadId;
+                }
+                else {
+                    normalized.threadId = `${channelId}:${encodeComponent(target.threadId, "threadId")}`;
+                }
+            }
+            return normalized;
+        },
+        resolveThreadId(target) {
+            const normalized = this.normalize(target);
+            return normalized.threadId ?? normalized.channelId ?? normalizeChannel(normalized.id);
+        },
+    };
+}
+function requireSlackSendTargetId(value, label) {
+    if (!SLACK_SEND_TARGET_ID_RULE.pattern.test(value)) {
+        throw new CrablineError(`Slack ${label} must be a native Slack conversation or user id such as C1234567890, G1234567890, D1234567890, U1234567890, or W1234567890.`, { kind: "config" });
+    }
+    return value;
+}
+function requireSlackThreadTs(value, label) {
+    if (!SLACK_TS_RULE.pattern.test(value)) {
+        throw new CrablineError(`Slack ${label} must be a Slack timestamp such as 1700000000.000100.`, {
+            kind: "config",
+        });
+    }
+    return value;
+}
+const SLACK_TARGET_CODEC = {
+    normalize(target) {
+        const channelId = requireSlackSendTargetId(target.channelId ?? target.id, "channelId");
+        const normalized = {
+            channelId,
+            id: target.id,
+            metadata: target.metadata,
+        };
+        if (target.threadId) {
+            normalized.threadId = requireSlackThreadTs(target.threadId, "threadId");
+        }
+        return normalized;
+    },
+    resolveThreadId(target) {
+        const normalized = this.normalize(target);
+        const channelId = normalized.channelId ?? normalized.id;
+        return slackTargetKey(channelId, normalized.threadId);
+    },
+};
+export function parseCanonicalTelegramTopic(value) {
+    return parseCanonicalTelegramTopicWithRule(value, TELEGRAM_CHAT_ID_RULE);
+}
+export function parseCanonicalTelegramInboundTopic(value) {
+    return parseCanonicalTelegramTopicWithRule(value, TELEGRAM_INBOUND_CHAT_ID_RULE);
+}
+function parseCanonicalTelegramTopicWithRule(value, chatRule) {
+    const separator = value.lastIndexOf(":");
+    if (separator <= 0) {
+        return undefined;
+    }
+    const chatId = value.slice(0, separator);
+    const topicId = value.slice(separator + 1);
+    if (!matchesNativeId(chatId, chatRule) ||
+        !matchesNativeId(topicId, TELEGRAM_MESSAGE_THREAD_ID_RULE)) {
+        return undefined;
+    }
+    const canonicalChatId = chatId.startsWith("@") && chatRule === TELEGRAM_CHAT_ID_RULE
+        ? canonicalizeTelegramUsername(chatId)
+        : chatId;
+    return canonicalChatId ? { chatId: canonicalChatId, topicId } : undefined;
+}
+const TELEGRAM_TARGET_CODEC = {
+    normalize(target) {
+        const canonicalTopic = target.threadId
+            ? parseCanonicalTelegramTopic(target.threadId)
+            : undefined;
+        const targetChatIdValue = requireNativeId(target.channelId ?? target.id, TELEGRAM_CHAT_ID_RULE, "Telegram chat_id");
+        const targetChatId = targetChatIdValue.startsWith("@")
+            ? canonicalizeTelegramUsername(targetChatIdValue)
+            : targetChatIdValue;
+        if (canonicalTopic && targetChatId !== canonicalTopic.chatId) {
+            throw new CrablineError("Telegram canonical topic chat_id must match the target chat_id.", {
+                kind: "config",
+            });
+        }
+        const normalized = {
+            channelId: canonicalTopic?.chatId ?? targetChatId,
+            id: target.id,
+            metadata: target.metadata,
+        };
+        if (!target.threadId) {
+            return normalized;
+        }
+        const topicId = requireNativeId(canonicalTopic?.topicId ?? target.threadId, TELEGRAM_MESSAGE_THREAD_ID_RULE, "Telegram message_thread_id");
+        return {
+            ...normalized,
+            threadId: `${normalized.channelId}:${topicId}`,
+        };
+    },
+    resolveThreadId(target) {
+        const normalized = this.normalize(target);
+        return normalized.threadId ?? normalized.channelId ?? normalized.id;
+    },
+};
+const GOOGLE_CHAT_TARGET_CODEC = {
+    normalize(target) {
+        const channelId = requireNativeId(target.channelId ?? target.id, GOOGLE_CHAT_SPACE_RULE, "Google Chat space.name");
+        const normalized = {
+            channelId,
+            id: target.id,
+            metadata: target.metadata,
+        };
+        if (target.threadId) {
+            const threadId = requireNativeId(target.threadId, GOOGLE_CHAT_THREAD_RULE, "Google Chat thread.name");
+            if (!threadId.startsWith(`${channelId}/threads/`)) {
+                throw new CrablineError("Google Chat thread.name must belong to the target space.name.", {
+                    kind: "config",
+                });
+            }
+            normalized.threadId = threadId;
+        }
+        return normalized;
+    },
+    resolveThreadId(target) {
+        const normalized = this.normalize(target);
+        return normalized.threadId ?? normalized.channelId ?? normalized.id;
+    },
+};
+const MATRIX_TARGET_CODEC = {
+    normalize(target) {
+        const channelId = target.channelId ?? target.id;
+        if (!isMatrixRoomId(channelId)) {
+            throw new CrablineError(`Matrix room_id must be a native ${MATRIX_ROOM_ID_RULE.name} such as ${MATRIX_ROOM_ID_RULE.example}.`, { kind: "config" });
+        }
+        const normalized = {
+            channelId,
+            id: target.id,
+            metadata: target.metadata,
+        };
+        if (target.threadId) {
+            if (!isMatrixEventId(target.threadId)) {
+                throw new CrablineError(`Matrix event_id must be a native ${MATRIX_EVENT_ID_RULE.name} such as ${MATRIX_EVENT_ID_RULE.example}.`, { kind: "config" });
+            }
+            normalized.threadId = target.threadId;
+        }
+        return normalized;
+    },
+    resolveThreadId(target) {
+        const normalized = this.normalize(target);
+        return normalized.threadId ?? normalized.channelId ?? normalized.id;
+    },
+};
+const ZALO_BASE_TARGET_CODEC = createNativeTargetCodec({
+    channel: ZALO_ID_RULE,
+    channelLabel: "Zalo user_id or oa_id",
+});
+const ZALO_TARGET_CODEC = {
+    normalize(target) {
+        if (target.threadId) {
+            throw new CrablineError(ZALO_UNSUPPORTED_THREAD_TARGET_ERROR, { kind: "config" });
+        }
+        return ZALO_BASE_TARGET_CODEC.normalize(target);
+    },
+    resolveThreadId(target) {
+        const normalized = this.normalize(target);
+        return normalized.channelId ?? normalized.id;
+    },
+};
+const WHATSAPP_BASE_TARGET_CODEC = createNativeTargetCodec({
+    channel: WHATSAPP_WA_ID_RULE,
+    channelLabel: "WhatsApp wa_id",
+});
+const WHATSAPP_TARGET_CODEC = {
+    normalize(target) {
+        if (target.threadId) {
+            throw new CrablineError(WHATSAPP_UNSUPPORTED_THREAD_TARGET_ERROR, { kind: "config" });
+        }
+        return WHATSAPP_BASE_TARGET_CODEC.normalize(target);
+    },
+    resolveThreadId(target) {
+        const normalized = this.normalize(target);
+        return normalized.channelId ?? normalized.id;
+    },
+};
+const BUILTIN_TARGET_CODECS = {
+    discord: createNativeTargetCodec({
+        channel: DISCORD_SNOWFLAKE_RULE,
+        channelLabel: "Discord channel_id",
+        thread: DISCORD_SNOWFLAKE_RULE,
+        threadLabel: "Discord thread id",
+    }),
+    feishu: createNativeTargetCodec({
+        channel: FEISHU_CHAT_ID_RULE,
+        channelLabel: "Feishu chat_id",
+        thread: FEISHU_MESSAGE_ID_RULE,
+        threadLabel: "Feishu message_id",
+    }),
+    googlechat: GOOGLE_CHAT_TARGET_CODEC,
+    imessage: createNativeTargetCodec({
+        channel: IMESSAGE_THREAD_RULE,
+        channelLabel: "iMessage recipient or chat GUID",
+    }),
+    loopback: createGenericLocalMockTargetCodec("loopback"),
+    matrix: MATRIX_TARGET_CODEC,
+    mattermost: createNativeTargetCodec({
+        channel: MATTERMOST_ID_RULE,
+        channelLabel: "Mattermost channel_id",
+    }),
+    msteams: createNativeTargetCodec({
+        channel: MSTEAMS_CONVERSATION_ID_RULE,
+        channelLabel: "Microsoft Teams conversation.id",
+    }),
+    slack: SLACK_TARGET_CODEC,
+    telegram: TELEGRAM_TARGET_CODEC,
+    whatsapp: WHATSAPP_TARGET_CODEC,
+    zalo: ZALO_TARGET_CODEC,
+};
+export function getBuiltinTargetCodec(adapter) {
+    return BUILTIN_TARGET_CODECS[adapter];
+}
+export function normalizeBuiltinTarget(adapter, target) {
+    return getBuiltinTargetCodec(adapter).normalize(target);
+}
+//# sourceMappingURL=target-normalizers.js.map

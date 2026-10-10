@@ -1,0 +1,110 @@
+import fsSync, {} from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { FsSafeError } from "./errors.js";
+import { literalStoreRootPath } from "./file-store-boundary.js";
+import { isPathInside } from "./path.js";
+import { realpathSync } from "./realpath.js";
+import { recursiveMkdirPath } from "./recursive-mkdir-path.js";
+import { root } from "./root.js";
+import { nonrecursiveRemovalKind } from "./root-remove.js";
+import { getFsSafeTestHooks } from "./test-hooks.js";
+const REMOVE_EMPTY_DIRECTORY_OPTIONS = Object.freeze({
+    [nonrecursiveRemovalKind]: "directory",
+});
+export async function pruneExpiredStoreEntries(params) {
+    const now = Date.now();
+    const recursive = params.options.recursive ?? false;
+    const maxDepth = params.options.maxDepth;
+    const pruneEmptyDirs = (recursive || maxDepth !== undefined) && (params.options.pruneEmptyDirs ?? false);
+    await fs.mkdir(recursiveMkdirPath(params.rootDir), { recursive: true, mode: params.dirMode });
+    const rootReal = realpathSync.native(params.rootDir);
+    const scopedRoot = await root(rootReal);
+    const rootGuard = {
+        dir: rootReal,
+        realPath: rootReal,
+        stat: fsSync.lstatSync(rootReal, { bigint: true }),
+    };
+    async function assertRootGuard() {
+        const stat = fsSync.lstatSync(rootGuard.dir, { bigint: true });
+        if (stat.isSymbolicLink() ||
+            !stat.isDirectory() ||
+            stat.dev !== rootGuard.stat.dev ||
+            stat.ino !== rootGuard.stat.ino ||
+            realpathSync.native(rootGuard.dir) !== rootGuard.realPath) {
+            throw new FsSafeError("path-mismatch", "store root changed during prune");
+        }
+    }
+    async function readStableDirectory(dir) {
+        const before = observeOrNull(() => fsSync.lstatSync(dir, { bigint: true }));
+        if (!before || before.isSymbolicLink() || !before.isDirectory()) {
+            return null;
+        }
+        const real = observeOrNull(() => realpathSync.native(dir));
+        if (!real || !isPathInside(rootReal, real)) {
+            return null;
+        }
+        const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => null);
+        if (!entries) {
+            return null;
+        }
+        const after = observeOrNull(() => fsSync.lstatSync(dir, { bigint: true }));
+        if (!after || before.dev !== after.dev || before.ino !== after.ino) {
+            return null;
+        }
+        return entries;
+    }
+    async function pruneDir(dir, relativeDir, depth) {
+        const entries = await readStableDirectory(dir);
+        if (!entries) {
+            return false;
+        }
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+            const stat = observeOrNull(() => fsSync.lstatSync(fullPath));
+            if (!stat || stat.isSymbolicLink()) {
+                continue;
+            }
+            if (stat.isDirectory()) {
+                const shouldDescend = maxDepth !== undefined ? depth < maxDepth : recursive;
+                if (shouldDescend) {
+                    await getFsSafeTestHooks()?.beforeFileStorePruneDescend?.(fullPath);
+                }
+                if (shouldDescend && (await pruneDir(fullPath, relativePath, depth + 1))) {
+                    await assertRootGuard();
+                    // Keep empty-dir pruning on the same root-bounded remove path as files;
+                    // the Root fallback handles empty directories without recursive delete.
+                    await scopedRoot.remove(literalStoreRootPath(relativePath), REMOVE_EMPTY_DIRECTORY_OPTIONS).catch(() => undefined);
+                }
+                continue;
+            }
+            if (stat.isFile() && now - stat.mtimeMs > params.options.ttlMs) {
+                await assertRootGuard();
+                await scopedRoot.remove(literalStoreRootPath(relativePath), {
+                    assertBeforeMutation: () => {
+                        // Removal preparation can outlive the expiry observation above.
+                        const current = fsSync.lstatSync(fullPath);
+                        if (!current.isFile() || !(now - current.mtimeMs > params.options.ttlMs)) {
+                            throw new FsSafeError("path-mismatch", "store entry is no longer an expired file");
+                        }
+                    },
+                }).catch(() => undefined);
+            }
+        }
+        if (!pruneEmptyDirs) {
+            return false;
+        }
+        const remaining = await readStableDirectory(dir);
+        return remaining !== null && remaining.length === 0;
+    }
+    await pruneDir(rootReal, "", 0);
+}
+function observeOrNull(observe) {
+    try {
+        return observe();
+    }
+    catch {
+        return null;
+    }
+}

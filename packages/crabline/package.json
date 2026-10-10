@@ -1,0 +1,76 @@
+{
+  "name": "@openclaw/crabline",
+  "version": "0.1.28",
+  "description": "Standalone CLI for deterministic messaging provider E2E tests",
+  "homepage": "https://github.com/openclaw/crabline#readme",
+  "bugs": {
+    "url": "https://github.com/openclaw/crabline/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openclaw/crabline"
+  },
+  "bin": {
+    "crabline": "dist/src/bin/crabline.js"
+  },
+  "files": [
+    "assets/crabline-banner.svg",
+    "dist/src",
+    "README.md",
+    "docs/channel-setup.md",
+    "fixtures/examples/crabline.example.yaml"
+  ],
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"const fs = require('node:fs'); for (const path of ['dist', 'coverage']) fs.rmSync(path, { recursive: true, force: true })\"",
+    "dev": "tsx src/bin/crabline.ts",
+    "doctor": "tsx src/bin/crabline.ts doctor",
+    "fixtures": "tsx src/bin/crabline.ts fixtures",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "pnpm format:check && pnpm typecheck && oxlint --deny-warnings --allow vitest/require-mock-type-parameters --type-aware --tsconfig tsconfig.test.json src test tools vitest.config.ts",
+    "run": "tsx src/bin/crabline.ts run",
+    "test": "vitest run",
+    "test:autoreview": "vitest run test/autoreview-tooling.test.ts && node tools/run-autoreview-tests.mjs",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "verify": "pnpm lint && pnpm test:autoreview && pnpm build && pnpm test:coverage",
+    "check": "pnpm verify"
+  },
+  "dependencies": {
+    "@types/node": "^22.20.1",
+    "commander": "^15.0.0",
+    "curve25519-js": "^0.0.4",
+    "libsignal": "6.0.0",
+    "picocolors": "^1.1.1",
+    "proper-lockfile": "4.1.2",
+    "protobufjs": "8.8.0",
+    "re2js": "2.8.6",
+    "ws": "^8.21.3",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.13.0",
+      "onFail": "error"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.27.0"
+}

@@ -1,0 +1,58 @@
+import fsSync from "node:fs";
+import fs from "node:fs/promises";
+import { readFileHandleBounded } from "./bounded-read.js";
+import { assertNoUnsafeDeviceReadPath } from "./device-path.js";
+import { FsSafeError } from "./errors.js";
+import { resolveReadOpenFlags } from "./read-open-flags.js";
+import { realpathSync } from "./realpath.js";
+import { inspectFileIdentitySync } from "./strict-file-identity.js";
+import { prepareSecretRead, secretPathErrorCode, secretReadError, trimSecretFileContent, } from "./secret-read-policy.js";
+import { assertNoWindowsPathAlias } from "./windows-path-alias.js";
+export async function readSecretFile(filePath, label, options = {}) {
+    const { resolvedPath, maxBytes, rejectHardlinks, previewStat, inspectInput } = prepareSecretRead(filePath, label, options);
+    let handle;
+    let raw;
+    try {
+        const realPath = realpathSync.native(resolvedPath);
+        assertNoWindowsPathAlias(realPath, "filesystem", `${label} file path uses a Windows filesystem namespace alias`);
+        assertNoUnsafeDeviceReadPath(realPath);
+        handle = await fs.open(realPath, resolveReadOpenFlags());
+        const openedHandle = handle;
+        const openedStat = inspectFileIdentitySync(() => {
+            const stat = fsSync.fstatSync(openedHandle.fd, { bigint: true });
+            if (!stat.isFile() || (rejectHardlinks && stat.nlink > 1n)) {
+                throw new FsSafeError("path-mismatch", "security validation failed");
+            }
+            return stat;
+        }, previewStat);
+        inspectFileIdentitySync(() => {
+            const stat = fsSync.lstatSync(realPath, { bigint: true });
+            if (!stat.isFile())
+                throw new FsSafeError("path-mismatch", "security validation failed");
+            return stat;
+        }, openedStat);
+        inspectFileIdentitySync(() => inspectInput("secret path became a symlink"), openedStat);
+        raw = (await readFileHandleBounded(handle, maxBytes)).toString("utf8");
+    }
+    catch (error) {
+        throw secretReadError(error instanceof FsSafeError
+            ? error.code
+            : secretPathErrorCode(error) === "not-found" ? "not-found" : "read-failed", "read", label, resolvedPath, error);
+    }
+    finally {
+        await handle?.close().catch(() => undefined);
+    }
+    return trimSecretFileContent(raw, label, resolvedPath);
+}
+export async function tryReadSecretFile(filePath, label, options = {}) {
+    if (!filePath?.trim())
+        return undefined;
+    try {
+        return await readSecretFile(filePath, label, options);
+    }
+    catch (error) {
+        if (error instanceof FsSafeError && error.code === "not-found")
+            return undefined;
+        throw error;
+    }
+}

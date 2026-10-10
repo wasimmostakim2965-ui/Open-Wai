@@ -1,0 +1,125 @@
+import path from "node:path";
+import { CrablineError } from "../../core/errors.js";
+import { LocalMockProviderAdapter } from "../local-mock.js";
+import { matchesNativeId } from "../native-ids.js";
+import { getBuiltinTargetCodec, IMESSAGE_THREAD_RULE } from "../target-normalizers.js";
+import { authorFromBotFlag, genericMockPayloadWithNativeThread, isRecord, optionalRecord, optionalString, requireNativeInboundId, } from "./native-local-mock.js";
+import { requireExternalWebhookAuthentication } from "./external-webhook-auth.js";
+export function resolveIMessageAdapterConfig(config, env) {
+    const local = config.imessage?.local ?? true;
+    env ??= local ? {} : process.env;
+    const configuredApiKey = config.imessage?.apiKey;
+    const environmentApiKey = env.IMESSAGE_API_KEY;
+    let apiKey = configuredApiKey?.trim()
+        ? configuredApiKey
+        : environmentApiKey?.trim()
+            ? environmentApiKey
+            : undefined;
+    if (!apiKey) {
+        if (!local) {
+            throw new CrablineError("Remote iMessage mode requires imessage.apiKey or IMESSAGE_API_KEY to be non-empty.", { kind: "config" });
+        }
+        apiKey = "local-mock-imessage-api-key";
+    }
+    return {
+        apiKey,
+        local,
+        serverUrl: config.imessage?.serverUrl ?? env.IMESSAGE_SERVER_URL,
+    };
+}
+function isNativeIMessageData(data) {
+    return [
+        "chat_guid",
+        "chat_identifier",
+        "chatGuid",
+        "chatIdentifier",
+        "guid",
+        "is_from_me",
+        "isFromMe",
+    ].some((key) => key in data);
+}
+function iMessageNativeData(payload) {
+    const data = optionalRecord(payload, "data") ?? payload;
+    const params = optionalRecord(data, "params");
+    const message = optionalRecord(params ?? {}, "message") ?? optionalRecord(data, "message");
+    if (message && isNativeIMessageData(message)) {
+        return message;
+    }
+    return data;
+}
+function iMessageThreadIdentifiers(data) {
+    return [
+        optionalString(data, "chatGuid"),
+        optionalString(data, "chatIdentifier"),
+        optionalString(data, "chat_guid"),
+        optionalString(data, "chat_identifier"),
+    ].filter((value) => value !== undefined);
+}
+export class IMessageProviderAdapter extends LocalMockProviderAdapter {
+    constructor(id, config, _userName, _runtime) {
+        requireExternalWebhookAuthentication({
+            authenticated: false,
+            provider: "iMessage",
+            requirement: "a provider-native authenticated ingress mode, which this adapter does not support",
+            webhook: config.imessage?.webhook,
+        });
+        super({
+            codec: getBuiltinTargetCodec("imessage"),
+            config,
+            id,
+            options: {
+                defaultWebhook: { host: "127.0.0.1", path: "/imessage/webhook", port: 8796 },
+                endpointLabel: "webhook endpoint",
+                matchesThread: matchesIMessageThread,
+                normalizeWebhookPayload: normalizeIMessageWebhookPayload,
+                platform: "imessage",
+                publicUrl: config.imessage?.webhook.publicUrl,
+                recorderPath: config.imessage?.recorder.path
+                    ? path.resolve(config.imessage.recorder.path)
+                    : undefined,
+                webhook: config.imessage?.webhook,
+            },
+        });
+    }
+}
+export function matchesIMessageThread(candidateThreadId, expectedThreadId, target, raw) {
+    const rawPayload = isRecord(raw) ? raw : undefined;
+    const data = rawPayload ? iMessageNativeData(rawPayload) : undefined;
+    const aliases = data ? iMessageThreadIdentifiers(data) : [];
+    const expectedIdentifiers = new Set([target.channelId ?? target.id]);
+    if (expectedThreadId !== undefined) {
+        expectedIdentifiers.add(expectedThreadId);
+    }
+    return (expectedIdentifiers.has(candidateThreadId) ||
+        aliases.some((alias) => expectedIdentifiers.has(alias)));
+}
+function normalizeIMessageWebhookPayload(payload) {
+    if (!isRecord(payload)) {
+        throw new CrablineError("iMessage webhook payload must be an object", { kind: "inbound" });
+    }
+    const message = optionalRecord(payload, "message");
+    if ((message && !isNativeIMessageData(message)) ||
+        (!message && !isNativeIMessageData(payload) && optionalString(payload, "threadId"))) {
+        return genericMockPayloadWithNativeThread({
+            channelRule: IMESSAGE_THREAD_RULE,
+            payload,
+            threadRule: IMESSAGE_THREAD_RULE,
+        });
+    }
+    const data = iMessageNativeData(payload);
+    const threadId = iMessageThreadIdentifiers(data).find((candidate) => matchesNativeId(candidate, IMESSAGE_THREAD_RULE));
+    const text = optionalString(data, "text") ?? optionalString(data, "message");
+    if (!threadId || !text) {
+        throw new CrablineError("iMessage webhook payload requires chatGuid or chatIdentifier (including native snake_case aliases) and text", {
+            kind: "inbound",
+        });
+    }
+    return {
+        author: authorFromBotFlag(data.isFromMe === true || data.is_from_me === true),
+        ...(optionalString(data, "guid") ? { id: optionalString(data, "guid") } : {}),
+        raw: payload,
+        text,
+        threadId: requireNativeInboundId(threadId, IMESSAGE_THREAD_RULE, "iMessage chatGuid"),
+    };
+}
+//# sourceMappingURL=imessage.js.map

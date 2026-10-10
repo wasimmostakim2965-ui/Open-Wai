@@ -1,0 +1,204 @@
+import { collectSlackAttachmentText, collectSlackBlockText } from "../../providers/slack-text.js";
+import { createAdminInboundRequest, createOpenClawCrablineProviderBridge, DEFAULT_ACCOUNT_ID, isRecord, qaTargetForInbound, readString, } from "../shared.js";
+import { slackTargetKey, SLACK_CHANNEL_ID_RULE, SLACK_SEND_TARGET_ID_RULE, SLACK_TS_RULE, SLACK_USER_ID_RULE, } from "../../providers/slack-ids.js";
+import { throwProbeHttpError } from "./probe-response.js";
+function requireSlackSendTargetId(value, label) {
+    const trimmed = value.trim();
+    if (!SLACK_SEND_TARGET_ID_RULE.pattern.test(trimmed)) {
+        throw new Error(`${label} must be a native Slack conversation or user id.`);
+    }
+    return trimmed;
+}
+function requireSlackTargetKind(parsed, targetId) {
+    if ((parsed.native && parsed.kind === "direct") || parsed.threadId !== undefined) {
+        return;
+    }
+    const nativeKind = /^[DUW]/u.test(targetId) ? "direct" : "group";
+    if (parsed.kind !== nativeKind) {
+        throw new Error("Slack target kind does not match the native conversation id.");
+    }
+}
+function requireSlackChannelId(value, label) {
+    const trimmed = value.trim();
+    if (!SLACK_CHANNEL_ID_RULE.pattern.test(trimmed)) {
+        throw new Error(`${label} must be a native Slack conversation id.`);
+    }
+    return trimmed;
+}
+function requireSlackUserId(value, label) {
+    const trimmed = value.trim();
+    if (!SLACK_USER_ID_RULE.pattern.test(trimmed)) {
+        throw new Error(`${label} must be a native Slack user id.`);
+    }
+    return trimmed;
+}
+function requireSlackThreadTs(value, label) {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+    if (!SLACK_TS_RULE.pattern.test(trimmed)) {
+        throw new Error(`${label} must be a native Slack timestamp.`);
+    }
+    return trimmed;
+}
+function slackConversationKind(channel) {
+    return channel.startsWith("D") ? "direct" : "group";
+}
+function structuredSlackValues(value) {
+    if (Array.isArray(value)) {
+        return value;
+    }
+    if (typeof value !== "string") {
+        return [];
+    }
+    try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+    }
+    catch {
+        return [];
+    }
+}
+function slackOutboundText(body) {
+    if (typeof body.text === "string") {
+        if (body.text.trim()) {
+            return body.text;
+        }
+    }
+    const fallback = [];
+    collectSlackBlockText(structuredSlackValues(body.blocks), fallback);
+    collectSlackAttachmentText(structuredSlackValues(body.attachments), fallback);
+    return fallback.length > 0 ? fallback.join("\n") : undefined;
+}
+export const SLACK_OPENCLAW_CRABLINE_PROVIDER_BRIDGE = createOpenClawCrablineProviderBridge({
+    provider: "slack",
+    createAdapter(slack) {
+        return {
+            async probe(signal) {
+                const response = await fetch(`${slack.endpoints.apiRoot}auth.test`, {
+                    headers: { authorization: `Bearer ${slack.botToken}` },
+                    method: "POST",
+                    ...(signal ? { signal } : {}),
+                });
+                if (!response.ok) {
+                    await throwProbeHttpError(response, `Crabline Slack auth.test probe failed with HTTP ${response.status}.`);
+                }
+                const result = await response.json();
+                if (!isRecord(result) || result.ok !== true) {
+                    const error = isRecord(result) ? readString(result.error) : undefined;
+                    throw new Error(`Crabline Slack auth.test probe failed: ${error ?? "unknown_error"}.`);
+                }
+                return result;
+            },
+            createBinding() {
+                return {
+                    accountId: DEFAULT_ACCOUNT_ID,
+                    channel: "slack",
+                    createProviderReadinessEnv: (env) => ({
+                        ...env,
+                        SLACK_API_URL: slack.endpoints.apiRoot,
+                        SLACK_BOT_TOKEN: slack.botToken,
+                        SLACK_SIGNING_SECRET: slack.signingSecret,
+                    }),
+                    createGatewayConfig: (openclawConfig = {}) => {
+                        const channels = isRecord(openclawConfig.channels) ? openclawConfig.channels : {};
+                        const slackConfig = isRecord(channels.slack) ? channels.slack : {};
+                        const slackChannels = isRecord(slackConfig.channels) ? slackConfig.channels : {};
+                        const defaultSlackChannel = isRecord(slackChannels["*"]) ? slackChannels["*"] : {};
+                        return {
+                            ...openclawConfig,
+                            channels: {
+                                ...channels,
+                                slack: {
+                                    ...slackConfig,
+                                    enabled: true,
+                                    mode: "http",
+                                    botToken: slack.botToken,
+                                    signingSecret: slack.signingSecret,
+                                    webhookPath: "/slack/events",
+                                    dmPolicy: "open",
+                                    allowFrom: ["*"],
+                                    groupPolicy: "open",
+                                    channels: {
+                                        ...slackChannels,
+                                        "*": {
+                                            ...defaultSlackChannel,
+                                            requireMention: false,
+                                        },
+                                    },
+                                },
+                            },
+                        };
+                    },
+                    requiredPluginIds: ["slack"],
+                };
+            },
+            createAgentDelivery(parsed) {
+                const to = requireSlackSendTargetId(parsed.id, "Slack target");
+                const threadTs = requireSlackThreadTs(parsed.threadId, "Slack target thread");
+                if (threadTs && !SLACK_CHANNEL_ID_RULE.pattern.test(to)) {
+                    throw new Error("Slack thread targets require a native parent conversation id.");
+                }
+                requireSlackTargetKind(parsed, to);
+                return {
+                    channel: "slack",
+                    providerTargetKey: slackTargetKey(to, threadTs),
+                    to,
+                    replyChannel: "slack",
+                    replyTo: slackTargetKey(to, threadTs),
+                };
+            },
+            createInbound(input) {
+                const channel = requireSlackChannelId(input.conversation.id, "Slack conversation");
+                const kind = slackConversationKind(channel);
+                if (input.conversation.kind !== kind) {
+                    throw new Error("Slack inbound conversation kind does not match the native channel id.");
+                }
+                const user = requireSlackUserId(input.senderId, "Slack sender");
+                const threadTs = requireSlackThreadTs(input.threadId, "Slack thread");
+                return {
+                    ...createAdminInboundRequest(slack),
+                    providerBody: {
+                        channel,
+                        user,
+                        ...(input.senderName ? { username: input.senderName } : {}),
+                        ...(threadTs ? { threadTs } : {}),
+                        text: input.text,
+                    },
+                    providerTargetKey: slackTargetKey(channel, threadTs),
+                    qaTarget: qaTargetForInbound(input),
+                    stateConversation: {
+                        id: channel,
+                        kind,
+                    },
+                    ...(threadTs ? { threadId: threadTs } : {}),
+                };
+            },
+            createOutboundObservation({ event }) {
+                if (!isRecord(event) || event.type !== "api" || typeof event.path !== "string") {
+                    return null;
+                }
+                if (!event.path.endsWith("/api/chat.postMessage") || !isRecord(event.body)) {
+                    return null;
+                }
+                const channel = readString(event.body.channel);
+                const text = slackOutboundText(event.body);
+                if (!channel || !text) {
+                    return null;
+                }
+                const threadTs = readString(event.body.thread_ts);
+                const providerTargetKey = slackTargetKey(channel, threadTs);
+                return {
+                    accountId: DEFAULT_ACCOUNT_ID,
+                    senderId: "openclaw",
+                    senderName: "OpenClaw QA",
+                    text,
+                    providerTargetKeys: [providerTargetKey],
+                    fallbackTarget: providerTargetKey,
+                };
+            },
+        };
+    },
+});
+//# sourceMappingURL=slack.js.map

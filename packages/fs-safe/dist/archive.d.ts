@@ -1,0 +1,20 @@
+import { type ExtractArchiveOptions, type ArchivePlanEntry } from "./archive-plan.js";
+export type { ArchiveLogger, ExtractArchiveOptions } from "./archive-plan.js";
+export type { ArchiveEntryFilter, ArchiveEntryKind, ArchiveEntryModePolicy, ArchiveFilteredEntryPolicy, } from "./archive-plan.js";
+export { isWindowsDrivePath, normalizeArchiveEntryPath, resolveArchiveOutputPath, stripArchivePath, validateArchiveEntryPath, } from "./archive-entry.js";
+export { resolveArchiveKind, resolvePackedRootDir, type ArchiveKind } from "./archive-kind.js";
+export { readArchiveEntry } from "./archive-read.js";
+export { ARCHIVE_LIMIT_ERROR_CODE, ArchiveLimitError, DEFAULT_MAX_ARCHIVE_BYTES_ZIP, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_EXTRACTED_BYTES, DEFAULT_MAX_ENTRY_BYTES, DEFAULT_MAX_META_ENTRY_BYTES, DEFAULT_MAX_ENTRY_PATH_COMPONENTS, type ArchiveExtractLimits, type ArchiveLimitErrorCode, } from "./archive-limits.js";
+export { ArchiveFormatError, type ArchiveFormatErrorCode } from "./archive-errors.js";
+export { ArchiveSecurityError, type ArchiveSecurityErrorCode } from "./archive-errors.js";
+export { createArchiveSymlinkTraversalError, prepareArchiveDestinationDir, prepareArchiveOutputPath, withStagedArchiveDestination, } from "./archive-staging.js";
+export { mergeExtractedTreeIntoDestination } from "./archive-merge.js";
+export { createTarEntryPreflightChecker, type TarEntryInfo } from "./archive-plan.js";
+export { loadZipArchiveWithPreflight } from "./archive-zip-preflight.js";
+export { readZipCentralDirectoryEntryCount } from "./archive-zip-count.js";
+export type { ZipArchiveWithFiles } from "./archive-zip-loader.js";
+export declare function extractArchive(params: ExtractArchiveOptions): Promise<void>;
+export type InspectTarArchiveOptions = Pick<ExtractArchiveOptions, "archivePath" | "timeoutMs" | "limits" | "entryFilter" | "onFiltered">;
+export type InspectedTarEntry = Readonly<Pick<ArchivePlanEntry, "path" | "kind" | "size">>;
+/** Complete TAR/gzip admission and zero-strip extraction policy, without output writes. */
+export declare function inspectTarArchive(params: InspectTarArchiveOptions): Promise<readonly InspectedTarEntry[]>;

@@ -1,0 +1,336 @@
+import fs, {} from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import { recursiveMkdirPath } from "./recursive-mkdir-path.js";
+import { canonicalPathFromExistingAncestor } from "./absolute-path.js";
+import { readFileDescriptorBoundedSync } from "./bounded-read.js";
+import { assertAsyncDirectoryGuard, createAsyncDirectoryGuard, inspectDirectoryIdentity } from "./directory-guard.js";
+import { pinNodeDirectoryForMode, assertOwnedDirectory } from "./directory-mode-node.js";
+import { FsSafeError } from "./errors.js";
+import { hasNodeErrorCode } from "./path.js";
+import { openPinnedFileSync } from "./pinned-open.js";
+import { runPinnedWriteHelper } from "./pinned-write.js";
+import { ensureTrailingSep } from "./root-context.js";
+import { verifyAtomicWriteResult } from "./root-write-verification.js";
+import { prepareSecretRead, secretReadError, trimSecretFileContent, } from "./secret-read-policy.js";
+import { inspectFileIdentity, inspectFileIdentitySync } from "./strict-file-identity.js";
+import { serializePathWrite } from "./write-queue.js";
+import { assertNoWindowsPathAlias, isForeignWindowsShareOrDevicePath, resolvePathPreservingWindowsRoot, } from "./windows-path-alias.js";
+export const PRIVATE_SECRET_DIR_MODE = 0o700;
+export const PRIVATE_SECRET_FILE_MODE = 0o600;
+export function readSecretFileSync(filePath, label, options = {}) {
+    const { resolvedPath, maxBytes, rejectSymlink, rejectHardlinks, previewStat, inspectInput } = prepareSecretRead(filePath, label, options);
+    const opened = openPinnedFileSync({
+        filePath: resolvedPath,
+        rejectPathSymlink: rejectSymlink,
+        rejectHardlinks,
+    });
+    if (!opened.ok) {
+        throw secretReadError(opened.reason === "path" ? "not-found" : "path-mismatch", "read", label, resolvedPath, opened.reason === "validation" ? new Error("security validation failed") : opened.error);
+    }
+    let raw;
+    try {
+        // The pin already compared the descriptor and resolved name without yielding.
+        const openedIdentity = inspectFileIdentitySync(() => opened.identity, previewStat);
+        inspectFileIdentitySync(() => inspectInput("secret path became a symlink"), openedIdentity);
+        raw = readFileDescriptorBoundedSync(opened.fd, maxBytes).toString("utf8");
+    }
+    catch (error) {
+        try {
+            fs.closeSync(opened.fd);
+        }
+        catch { /* Preserve the read failure. */ }
+        throw secretReadError(error instanceof FsSafeError ? error.code : "read-failed", "read", label, resolvedPath, error);
+    }
+    fs.closeSync(opened.fd);
+    return trimSecretFileContent(raw, label, resolvedPath);
+}
+export function tryReadSecretFileSync(filePath, label, options = {}) {
+    if (!filePath?.trim()) {
+        return undefined;
+    }
+    try {
+        return readSecretFileSync(filePath, label, options);
+    }
+    catch (error) {
+        if (error instanceof FsSafeError && error.code === "not-found")
+            return undefined;
+        throw error;
+    }
+}
+function isRelativeEscape(relativePath) {
+    return relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath);
+}
+function assertPathWithinRoot(rootDir, targetPath) {
+    const relative = path.relative(rootDir, targetPath);
+    // path.relative folds Unicode case on Windows, so it alone could admit another host.
+    if (!relative || isRelativeEscape(relative) || isForeignWindowsShareOrDevicePath(targetPath, [rootDir])) {
+        throw new Error(`Private secret path must stay under ${rootDir}.`);
+    }
+}
+function assertRealPathWithinRoot(rootDir, targetPath) {
+    const relative = path.relative(rootDir, targetPath);
+    if (isRelativeEscape(relative)) {
+        throw new Error(`Private secret path must stay under ${rootDir}.`);
+    }
+}
+async function createPrivateDirectory(directory, mode) {
+    try {
+        await fsp.mkdir(directory, { mode });
+        return true;
+    }
+    catch (error) {
+        if (error.code === "EEXIST")
+            return false;
+        throw error;
+    }
+}
+async function enforcePrivateDirectoryMode(params) {
+    if (process.platform === "win32")
+        return;
+    const stat = await inspectDirectoryIdentity(params.realPath, params.identity);
+    if (!params.created) {
+        const actualMode = Number(stat.mode & 4095n);
+        if (actualMode !== params.mode) {
+            throw new FsSafeError("insecure-permissions", `Private secret directory ${JSON.stringify(params.realPath)} has insecure permissions ${actualMode.toString(8)}.`);
+        }
+        return;
+    }
+    const ownerUid = process.geteuid?.();
+    if (ownerUid === undefined) {
+        throw new FsSafeError("helper-unavailable", "secret directory initialization requires owner identity");
+    }
+    const owner = await pinNodeDirectoryForMode(params.realPath, {
+        expectedIdentity: params.identity,
+        ownerUid,
+    });
+    try {
+        await owner.apply(params.mode, { beforeChmod: params.beforeChmod });
+    }
+    finally {
+        await owner.close();
+    }
+}
+async function inspectPrivateDirectory(directory, kind) {
+    return await inspectFileIdentity(async () => {
+        const stat = fs.lstatSync(directory, { bigint: true });
+        if (stat.isSymbolicLink()) {
+            throw new Error(`Private secret ${kind} ${directory} must not be a symlink.`);
+        }
+        if (!stat.isDirectory()) {
+            throw new Error(`Private secret ${kind} ${directory} must be a directory.`);
+        }
+        return stat;
+    });
+}
+async function ensurePrivateDirectory(rootDir, targetDir, mode) {
+    const resolvedRoot = resolvePathPreservingWindowsRoot(rootDir);
+    const resolvedTarget = resolvePathPreservingWindowsRoot(targetDir);
+    let rootStat = await inspectPrivateDirectory(resolvedRoot, "root").catch((error) => {
+        if (error.code !== "ENOENT")
+            throw error;
+        return undefined;
+    });
+    let createdRoot = false;
+    if (!rootStat) {
+        try {
+            createdRoot = await createPrivateDirectory(resolvedRoot, mode);
+        }
+        catch (error) {
+            if (error.code !== "ENOENT")
+                throw error;
+            await fsp.mkdir(recursiveMkdirPath(path.dirname(resolvedRoot)), { recursive: true, mode });
+            createdRoot = await createPrivateDirectory(resolvedRoot, mode);
+        }
+        rootStat = await inspectPrivateDirectory(resolvedRoot, "root");
+    }
+    const rootGuard = await createAsyncDirectoryGuard(resolvedRoot, { bigint: true });
+    assertOwnedDirectory(rootStat, rootGuard.stat);
+    await enforcePrivateDirectoryMode({
+        realPath: rootGuard.realPath, identity: rootStat, mode, created: createdRoot,
+        beforeChmod: () => assertAsyncDirectoryGuard(rootGuard),
+    });
+    await assertAsyncDirectoryGuard(rootGuard);
+    if (resolvedTarget === resolvedRoot) {
+        return { rootGuard, parentGuard: rootGuard };
+    }
+    assertPathWithinRoot(resolvedRoot, resolvedTarget);
+    const resolvedRootReal = rootGuard.realPath;
+    let current = resolvedRoot;
+    let targetGuard = rootGuard;
+    for (const segment of path
+        .relative(resolvedRoot, resolvedTarget)
+        .split(path.sep)
+        .filter(Boolean)) {
+        current = path.join(current, segment);
+        const parentGuard = targetGuard;
+        let created = false;
+        let identity;
+        while (true) {
+            await assertAsyncDirectoryGuard(rootGuard);
+            await assertAsyncDirectoryGuard(parentGuard);
+            try {
+                identity = await inspectPrivateDirectory(current, "directory component");
+                break;
+            }
+            catch (error) {
+                if (!hasNodeErrorCode(error, "ENOENT"))
+                    throw error;
+                await assertAsyncDirectoryGuard(parentGuard);
+                created = await createPrivateDirectory(current, mode);
+                // EEXIST grants no initialization authority; both outcomes need fresh type checks.
+            }
+        }
+        const currentGuard = await createAsyncDirectoryGuard(current, { bigint: true });
+        assertOwnedDirectory(identity, currentGuard.stat);
+        assertRealPathWithinRoot(resolvedRootReal, currentGuard.realPath);
+        await enforcePrivateDirectoryMode({
+            realPath: currentGuard.realPath, identity, mode, created,
+            beforeChmod: async () => {
+                await assertAsyncDirectoryGuard(parentGuard);
+                await assertAsyncDirectoryGuard(rootGuard);
+                await assertAsyncDirectoryGuard(currentGuard);
+            },
+        });
+        await assertAsyncDirectoryGuard(parentGuard);
+        await assertAsyncDirectoryGuard(rootGuard);
+        await assertAsyncDirectoryGuard(currentGuard);
+        targetGuard = currentGuard;
+    }
+    return { rootGuard, parentGuard: targetGuard };
+}
+function snapshotSecretFileWriteParams(params) {
+    const rootDir = params.rootDir;
+    const filePath = params.filePath;
+    assertNoWindowsPathAlias(rootDir, "filesystem", "private secret root uses a Windows filesystem namespace alias");
+    assertNoWindowsPathAlias(filePath, "filesystem", "private secret path uses a Windows filesystem namespace alias");
+    return {
+        rootDir,
+        filePath,
+        content: params.content,
+        mode: params.mode,
+        dirMode: params.dirMode,
+        durable: params.durable,
+    };
+}
+async function secretFileWriteQueueKey(rootDir, filePath) {
+    assertNoWindowsPathAlias(rootDir, "filesystem", "private secret root uses a Windows filesystem namespace alias");
+    assertNoWindowsPathAlias(filePath, "filesystem", "private secret path uses a Windows filesystem namespace alias");
+    // Canonicalizing an outside path would probe it first; a foreign share contacts its host.
+    assertPathWithinRoot(resolvePathPreservingWindowsRoot(rootDir), path.resolve(filePath));
+    try {
+        return await canonicalPathFromExistingAncestor(filePath);
+    }
+    catch (error) {
+        if (error instanceof FsSafeError && error.code === "invalid-path")
+            throw error;
+        // Keep validation and its public error shape owned by the write path below.
+        const resolved = path.resolve(filePath);
+        assertNoWindowsPathAlias(resolved, "filesystem", "private secret path uses a Windows filesystem namespace alias");
+        return resolved;
+    }
+}
+// Internal preparation for private writers and their pre-write locks; not lasting authorization.
+export async function prepareSecretFileWrite(params) {
+    const rootDir = params.rootDir;
+    const filePath = params.filePath;
+    assertNoWindowsPathAlias(rootDir, "filesystem", "private secret root uses a Windows filesystem namespace alias");
+    assertNoWindowsPathAlias(filePath, "filesystem", "private secret path uses a Windows filesystem namespace alias");
+    const mode = params.mode ?? PRIVATE_SECRET_FILE_MODE;
+    const dirMode = params.dirMode ?? PRIVATE_SECRET_DIR_MODE;
+    const resolvedRoot = resolvePathPreservingWindowsRoot(rootDir);
+    const resolvedFile = path.resolve(filePath);
+    assertNoWindowsPathAlias(resolvedRoot, "filesystem", "private secret root uses a Windows filesystem namespace alias");
+    assertNoWindowsPathAlias(resolvedFile, "filesystem", "private secret path uses a Windows filesystem namespace alias");
+    assertPathWithinRoot(resolvedRoot, resolvedFile);
+    for (const [kind, value] of [["file", mode], ["directory", dirMode]]) {
+        if (!Number.isInteger(value) || value < 0 || value > 0o7777) {
+            throw new FsSafeError("invalid-path", `Private secret ${kind} mode must be an integer between 0o0000 and 0o7777.`);
+        }
+    }
+    const intendedParentDir = path.dirname(resolvedFile);
+    const { rootGuard, parentGuard } = await ensurePrivateDirectory(resolvedRoot, intendedParentDir, dirMode);
+    await assertAsyncDirectoryGuard(rootGuard);
+    await assertAsyncDirectoryGuard(parentGuard);
+    assertRealPathWithinRoot(rootGuard.realPath, parentGuard.realPath);
+    assertNoWindowsPathAlias(rootGuard.realPath, "filesystem", "private secret root uses a Windows filesystem namespace alias");
+    assertNoWindowsPathAlias(parentGuard.realPath, "filesystem", "private secret parent uses a Windows filesystem namespace alias");
+    const fileName = path.basename(resolvedFile);
+    const finalFilePath = path.join(parentGuard.realPath, fileName);
+    assertNoWindowsPathAlias(finalFilePath, "filesystem", "private secret path uses a Windows filesystem namespace alias");
+    return { mode, rootGuard, parentGuard, fileName, finalFilePath };
+}
+async function materializeSecretFileAtomic(params, createOnly) {
+    const { mode, rootGuard, parentGuard, fileName, finalFilePath } = await prepareSecretFileWrite(params);
+    try {
+        const stat = fs.lstatSync(finalFilePath);
+        if (createOnly) {
+            throw new FsSafeError("secret-exists", `Private secret file ${finalFilePath} already exists.`);
+        }
+        if (stat.isSymbolicLink()) {
+            throw new Error(`Private secret file ${finalFilePath} must not be a symlink.`);
+        }
+        if (!stat.isFile()) {
+            throw new Error(`Private secret file ${finalFilePath} must be a regular file.`);
+        }
+    }
+    catch (error) {
+        if (!hasNodeErrorCode(error, "ENOENT"))
+            throw error;
+    }
+    await assertAsyncDirectoryGuard(rootGuard);
+    await assertAsyncDirectoryGuard(parentGuard);
+    await runPinnedWriteHelper({
+        rootPath: parentGuard.realPath,
+        relativeParentPath: "",
+        basename: fileName,
+        mkdir: false,
+        mode,
+        verifyPosixMode: true,
+        sync: params.durable !== false,
+        strictFileSync: createOnly && params.durable === "file",
+        overwrite: !createOnly,
+        input: { kind: "buffer", data: typeof params.content === "string" ? params.content : Buffer.from(params.content) },
+        rootIdentity: { dev: parentGuard.stat.dev, ino: parentGuard.stat.ino },
+        verifyPublished: async (fd, expectedIdentity, publishedParentGuard) => {
+            await assertAsyncDirectoryGuard(rootGuard);
+            await assertAsyncDirectoryGuard(parentGuard);
+            await verifyAtomicWriteResult({
+                root: {
+                    rootDir: rootGuard.dir,
+                    rootReal: rootGuard.realPath,
+                    rootWithSep: ensureTrailingSep(rootGuard.realPath),
+                    rootIdentity: { dev: rootGuard.stat.dev, ino: rootGuard.stat.ino },
+                },
+                targetPath: finalFilePath,
+                fd,
+                expectedIdentity,
+                expectedMode: mode,
+                parentGuard: publishedParentGuard,
+            });
+        },
+    });
+}
+export async function writeSecretFileAtomic(params) {
+    const ownedParams = snapshotSecretFileWriteParams(params);
+    const canonicalPath = await secretFileWriteQueueKey(ownedParams.rootDir, ownedParams.filePath);
+    await serializePathWrite(canonicalPath, async () => {
+        await materializeSecretFileAtomic(ownedParams, false);
+    });
+}
+export async function createSecretFileAtomic(params) {
+    try {
+        const ownedParams = snapshotSecretFileWriteParams(params);
+        const canonicalPath = await secretFileWriteQueueKey(ownedParams.rootDir, ownedParams.filePath);
+        await serializePathWrite(canonicalPath, async () => {
+            await materializeSecretFileAtomic(ownedParams, true);
+        });
+    }
+    catch (error) {
+        if ((error instanceof FsSafeError && error.code === "already-exists") ||
+            error?.code === "EEXIST") {
+            throw new FsSafeError("secret-exists", "Private secret file already exists.", { cause: error });
+        }
+        throw error;
+    }
+}

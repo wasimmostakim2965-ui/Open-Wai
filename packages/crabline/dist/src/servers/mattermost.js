@@ -1,0 +1,940 @@
+import { createHash, randomBytes } from "node:crypto";
+import path from "node:path";
+import { WebSocket, WebSocketServer } from "ws";
+import { adminAuthError, createServerClose, constantTimeTokenEqual, drainRequestBody, hasAdminToken, InvalidJsonBodyError, isJsonObject, isJsonMediaType, isLoopbackHost, jsonResponse, parseUnknownRequestBody, queryRecord, RequestBodyTooLargeError, startHttpJsonServer, } from "./http.js";
+import { createServerRecorder } from "./recorder.js";
+import { resolveMaxPendingInboundEvents } from "./pending-events.js";
+import { closeWebSocketServer } from "./websocket.js";
+const DEFAULT_WEBSOCKET_AUTHENTICATION_TIMEOUT_MS = 5_000;
+const DEFAULT_MAX_WEBSOCKET_BUFFERED_BYTES = 1024 * 1024;
+const DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES = 64 * 1024;
+const DEFAULT_MAX_UNAUTHENTICATED_WEBSOCKET_CLIENTS = 32;
+const DEFAULT_MAX_COMMITTED_CHANNELS = 1_000;
+const DEFAULT_MAX_COMMITTED_POSTS = 1_000;
+const DEFAULT_MAX_COMMITTED_STATE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_COMMITTED_USERS = 1_000;
+const DEFAULT_MAX_PENDING_INBOUND_BYTES = 64 * 1024 * 1024;
+const MATTERMOST_ID_PATTERN = /^[a-z0-9]{26}(?![\s\S])/u;
+const MATTERMOST_USERNAME_PATTERN = /^[a-z0-9._-]{1,64}$/u;
+const MATTERMOST_CHANNEL_TYPES = new Set(["D", "G", "O", "P"]);
+const MATTERMOST_RESTRICTED_USERNAMES = new Set(["all", "channel", "matterbot", "system"]);
+function resolvePositiveLimit(value, name, fallback) {
+    if (value === undefined) {
+        return fallback;
+    }
+    if (!Number.isSafeInteger(value) || value < 1) {
+        throw new Error(`${name} must be a positive safe integer.`);
+    }
+    return value;
+}
+export function mattermostId(value) {
+    return createHash("sha256").update(value).digest("hex").slice(0, 26);
+}
+function mattermostDirectChannelName(firstUserId, secondUserId) {
+    return [firstUserId, secondUserId].sort().join("__");
+}
+async function appendEvent(state, event, committed = false) {
+    await (committed ? state.recorder.recordCommitted(event) : state.recorder.record(event));
+}
+function authorized(request, token) {
+    const providedToken = /^Bearer ([^\s]+)$/iu.exec(request.headers.authorization ?? "")?.[1];
+    return providedToken ? constantTimeTokenEqual(providedToken, token) : false;
+}
+function mattermostError(message, status, options = {}) {
+    return jsonResponse({
+        detailed_error: "",
+        id: options.id ?? `api.context.${status}.app_error`,
+        message,
+        request_id: options.requestId ??
+            mattermostId(`request-${Date.now()}-${Math.random()}-${message}-${status}`),
+        status_code: status,
+    }, status);
+}
+function readMattermostString(value) {
+    if (typeof value !== "string") {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+}
+function readMattermostMessage(value) {
+    return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+function readMattermostId(value) {
+    return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+function isMattermostId(value) {
+    return MATTERMOST_ID_PATTERN.test(value);
+}
+function normalizeMattermostUsername(value) {
+    if (typeof value !== "string" || value !== value.trim()) {
+        return undefined;
+    }
+    const normalized = value.toLowerCase();
+    return MATTERMOST_USERNAME_PATTERN.test(normalized) &&
+        !MATTERMOST_RESTRICTED_USERNAMES.has(normalized)
+        ? normalized
+        : undefined;
+}
+function requestHasJsonMediaType(request) {
+    const contentType = request.headers["content-type"];
+    return Array.isArray(contentType)
+        ? contentType.some(isJsonMediaType)
+        : typeof contentType === "string" && isJsonMediaType(contentType);
+}
+function decodeMattermostPathSegment(value) {
+    try {
+        return decodeURIComponent(value);
+    }
+    catch {
+        return mattermostError("Invalid path parameter", 400);
+    }
+}
+function eventBroadcast(params) {
+    return {
+        channel_id: params.channelId ?? "",
+        omit_users: params.omitUsers ?? null,
+        team_id: "",
+        user_id: params.userId ?? "",
+    };
+}
+function postEvent(event, post, senderName, channel) {
+    return {
+        event,
+        data: event === "posted"
+            ? {
+                channel_display_name: channel.display_name,
+                channel_name: channel.name,
+                channel_type: channel.type,
+                post: JSON.stringify(post),
+                sender_name: senderName,
+                set_online: true,
+                team_id: "",
+            }
+            : { post: JSON.stringify(post) },
+        broadcast: eventBroadcast({ channelId: post.channel_id }),
+    };
+}
+function webSocketEventBytes(event) {
+    return Buffer.byteLength(JSON.stringify({ ...event, seq: Number.MAX_SAFE_INTEGER }), "utf8");
+}
+function retainedValueBytes(value) {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? 0 : Buffer.byteLength(serialized, "utf8");
+}
+function retainedValueDelta(previous, next) {
+    return retainedValueBytes(next) - retainedValueBytes(previous);
+}
+function canRetainCommittedValues(state, replacements) {
+    const delta = replacements.reduce((total, [previous, next]) => total + retainedValueDelta(previous, next), 0);
+    return state.committedStateBytes + delta <= state.maxCommittedStateBytes;
+}
+function setCommittedValue(state, values, key, value) {
+    state.committedStateBytes += retainedValueDelta(values.get(key), value);
+    values.set(key, value);
+}
+function deleteCommittedValue(state, values, key) {
+    const previous = values.get(key);
+    if (previous === undefined) {
+        return;
+    }
+    state.committedStateBytes -= retainedValueBytes(previous);
+    values.delete(key);
+}
+function sendEvent(state, client, event) {
+    const seq = state.websocketClients.get(client);
+    if (seq === undefined || client.readyState !== WebSocket.OPEN) {
+        state.websocketClients.delete(client);
+        return false;
+    }
+    const payload = JSON.stringify({ ...event, seq });
+    const payloadBytes = Buffer.byteLength(payload, "utf8");
+    if (payloadBytes > state.maxWebSocketBufferedBytes) {
+        return false;
+    }
+    if (client.bufferedAmount + payloadBytes > state.maxWebSocketBufferedBytes) {
+        state.websocketClients.delete(client);
+        client.close(1013, "client too slow");
+        return false;
+    }
+    try {
+        client.send(payload);
+    }
+    catch {
+        state.websocketClients.delete(client);
+        client.terminate();
+        return false;
+    }
+    state.websocketClients.set(client, seq + 1);
+    return true;
+}
+function sendControlMessage(state, client, value) {
+    if (client.readyState !== WebSocket.OPEN) {
+        state.websocketClients.delete(client);
+        return false;
+    }
+    const payload = JSON.stringify(value);
+    if (client.bufferedAmount + Buffer.byteLength(payload, "utf8") >
+        state.maxWebSocketBufferedBytes) {
+        state.websocketClients.delete(client);
+        client.close(1013, "client too slow");
+        return false;
+    }
+    try {
+        client.send(payload);
+        return true;
+    }
+    catch {
+        state.websocketClients.delete(client);
+        client.terminate();
+        return false;
+    }
+}
+function broadcast(state, event, queueIfUndelivered = true) {
+    if (event.broadcast.omit_users?.[state.botUserId]) {
+        return true;
+    }
+    if (webSocketEventBytes(event) > state.maxWebSocketBufferedBytes) {
+        return false;
+    }
+    let delivered = false;
+    for (const client of state.websocketClients.keys()) {
+        delivered = sendEvent(state, client, event) || delivered;
+    }
+    if (delivered) {
+        return true;
+    }
+    if (!queueIfUndelivered) {
+        return false;
+    }
+    if (state.pendingEvents.length >= state.maxPendingInboundEvents) {
+        return false;
+    }
+    const eventBytes = retainedValueBytes(event);
+    if (state.pendingEventBytes + eventBytes > state.maxPendingInboundBytes) {
+        return false;
+    }
+    state.pendingEvents.push(event);
+    state.pendingEventBytes += eventBytes;
+    return true;
+}
+function pendingQueueFullResponse(state) {
+    return jsonResponse({
+        error: `Pending inbound queue is full (${state.maxPendingInboundEvents} events)`,
+        ok: false,
+    }, 503);
+}
+function committedStateFullResponse(resource) {
+    return jsonResponse({
+        error: `Committed Mattermost ${resource} limit reached`,
+        ok: false,
+    }, 503);
+}
+function buildPost(params) {
+    const now = Date.now();
+    return {
+        channel_id: params.channelId,
+        create_at: now,
+        delete_at: 0,
+        edit_at: 0,
+        id: params.id,
+        message: params.message,
+        root_id: params.rootId ?? "",
+        type: "",
+        update_at: now,
+        user_id: params.userId,
+    };
+}
+function buildNextPost(state, params, reservedId) {
+    let nextPost = state.nextPost;
+    let id;
+    do {
+        id = mattermostId(`post-${nextPost++}`);
+    } while (id === reservedId || state.posts.has(id));
+    return { nextPost, post: buildPost({ ...params, id }) };
+}
+function commitNextPost(state, pending) {
+    state.nextPost = pending.nextPost;
+    setCommittedValue(state, state.posts, pending.post.id, pending.post);
+}
+function commitNextPostIfCapacity(state, pending) {
+    if (!canRetainCommittedValues(state, [[undefined, pending.post]])) {
+        return false;
+    }
+    commitNextPost(state, pending);
+    return true;
+}
+function nextDirectChannelId(state, seed) {
+    let collision = 0;
+    let channelId;
+    do {
+        channelId = mattermostId(collision === 0 ? seed : `${seed}:${collision}`);
+        collision += 1;
+    } while (state.channels.has(channelId));
+    return channelId;
+}
+function findDirectChannel(state, channelName) {
+    return [...state.channels.values()].find((channel) => channel.type === "D" && channel.name === channelName);
+}
+function webSocketEventTooLargeResponse() {
+    return mattermostError("WebSocket event is too large", 413);
+}
+function handleAdminInbound(params) {
+    for (const field of ["senderName", "channelType", "rootId", "root_id"]) {
+        if (params.body[field] !== undefined && typeof params.body[field] !== "string") {
+            return jsonResponse({ error: `${field} must be a string`, ok: false }, 400);
+        }
+    }
+    const requestedChannelId = readMattermostId(params.body.channelId ?? params.body.channel_id);
+    const senderId = readMattermostId(params.body.senderId ?? params.body.user_id);
+    const text = readMattermostMessage(params.body.text ?? params.body.message);
+    if (!senderId || !text) {
+        return jsonResponse({ error: "senderId and text are required", ok: false }, 400);
+    }
+    if (requestedChannelId && !isMattermostId(requestedChannelId)) {
+        return jsonResponse({ error: "channelId must be a 26-character Mattermost ID", ok: false }, 400);
+    }
+    if (!isMattermostId(senderId)) {
+        return jsonResponse({ error: "senderId must be a 26-character Mattermost ID", ok: false }, 400);
+    }
+    const rootId = readMattermostId(params.body.rootId ?? params.body.root_id);
+    if (rootId && !isMattermostId(rootId)) {
+        return jsonResponse({ error: "rootId must be a 26-character Mattermost ID", ok: false }, 400);
+    }
+    for (const field of [
+        "channelName",
+        "channel_name",
+        "channelDisplayName",
+        "channel_display_name",
+    ]) {
+        if (params.body[field] !== undefined && typeof params.body[field] !== "string") {
+            return jsonResponse({ error: `${field} must be a string`, ok: false }, 400);
+        }
+    }
+    if (params.state.websocketClients.size === 0 &&
+        params.state.pendingEvents.length >= params.state.maxPendingInboundEvents) {
+        return pendingQueueFullResponse(params.state);
+    }
+    const previousUser = params.state.users.get(senderId);
+    const senderName = params.body.senderName === undefined
+        ? (previousUser?.username ?? senderId)
+        : normalizeMattermostUsername(params.body.senderName);
+    if (!senderName) {
+        return jsonResponse({ error: "senderName must be a valid Mattermost username", ok: false }, 400);
+    }
+    if (senderId === params.state.botUserId && senderName !== params.state.botUsername) {
+        return jsonResponse({ error: "senderName must match the configured bot username", ok: false }, 400);
+    }
+    const usernameOwner = params.state.userIdsByUsername.get(senderName);
+    if (usernameOwner && usernameOwner !== senderId) {
+        return jsonResponse({ error: "senderName is already in use", ok: false }, 400);
+    }
+    const requestedChannel = requestedChannelId
+        ? params.state.channels.get(requestedChannelId)
+        : undefined;
+    const channelType = params.body.channelType === undefined
+        ? (requestedChannel?.type ?? "D")
+        : readMattermostString(params.body.channelType);
+    if (!channelType || !MATTERMOST_CHANNEL_TYPES.has(channelType)) {
+        return jsonResponse({ error: "channelType is not supported", ok: false }, 400);
+    }
+    const suppliedChannelName = readMattermostString(params.body.channelName ?? params.body.channel_name);
+    const canonicalDirectName = mattermostDirectChannelName(params.state.botUserId, senderId);
+    const resolveCanonicalDirect = channelType === "D" && !requestedChannelId;
+    if (!requestedChannelId && !resolveCanonicalDirect) {
+        return jsonResponse({ error: "channelId is required", ok: false }, 400);
+    }
+    const existingDirect = resolveCanonicalDirect
+        ? findDirectChannel(params.state, canonicalDirectName)
+        : undefined;
+    const channelId = resolveCanonicalDirect
+        ? (existingDirect?.id ??
+            nextDirectChannelId(params.state, `dm:${canonicalDirectName.replace("__", ":")}`))
+        : requestedChannelId;
+    if (!channelId) {
+        return jsonResponse({ error: "channelId is required", ok: false }, 400);
+    }
+    const previousChannel = params.state.channels.get(channelId);
+    const channelName = resolveCanonicalDirect
+        ? canonicalDirectName
+        : (suppliedChannelName ??
+            previousChannel?.name ??
+            (channelType === "D" ? canonicalDirectName : channelId));
+    const channelDisplayName = readMattermostString(params.body.channelDisplayName ?? params.body.channel_display_name) ??
+        previousChannel?.display_name ??
+        (channelType === "D" ? "" : channelName);
+    const channel = {
+        display_name: channelDisplayName,
+        id: channelId,
+        name: channelName,
+        type: channelType,
+    };
+    const existingRoot = rootId ? params.state.posts.get(rootId) : undefined;
+    if (existingRoot && existingRoot.channel_id !== channelId) {
+        return jsonResponse({ error: "Root post belongs to another channel", ok: false }, 400);
+    }
+    if (existingRoot?.root_id) {
+        return jsonResponse({ error: "Root post is itself a reply", ok: false }, 400);
+    }
+    if (!previousUser && params.state.users.size >= params.state.maxCommittedUsers) {
+        return committedStateFullResponse("users");
+    }
+    if (!previousChannel && params.state.channels.size >= params.state.maxCommittedChannels) {
+        return committedStateFullResponse("channels");
+    }
+    // buildNextPost always allocates a fresh ID, including against a synthesized root.
+    const requiredPostSlots = 1 + (rootId && !existingRoot ? 1 : 0);
+    if (params.state.posts.size + requiredPostSlots > params.state.maxCommittedPosts) {
+        return committedStateFullResponse("posts");
+    }
+    const rootPost = rootId && !existingRoot
+        ? buildPost({
+            channelId,
+            id: rootId,
+            message: "",
+            userId: senderId,
+        })
+        : undefined;
+    const pendingPost = buildNextPost(params.state, {
+        channelId,
+        message: text,
+        rootId,
+        userId: senderId,
+    }, rootPost?.id);
+    const { post } = pendingPost;
+    const user = { id: senderId, update_at: Date.now(), username: senderName };
+    if (!canRetainCommittedValues(params.state, [
+        [previousUser, user],
+        [previousChannel, channel],
+        [undefined, rootPost],
+        [undefined, post],
+    ])) {
+        return committedStateFullResponse("state");
+    }
+    const event = postEvent("posted", post, senderName, channel);
+    if (webSocketEventBytes(event) > params.state.maxWebSocketBufferedBytes) {
+        return jsonResponse({ error: "Inbound event is too large", ok: false }, 413);
+    }
+    const previousNextPost = params.state.nextPost;
+    if (previousUser?.username !== senderName) {
+        params.state.userIdsByUsername.delete(previousUser?.username ?? "");
+    }
+    params.state.userIdsByUsername.set(senderName, senderId);
+    setCommittedValue(params.state, params.state.users, senderId, user);
+    setCommittedValue(params.state, params.state.channels, channelId, channel);
+    if (rootPost) {
+        setCommittedValue(params.state, params.state.posts, rootPost.id, rootPost);
+    }
+    commitNextPost(params.state, pendingPost);
+    const rollback = () => {
+        deleteCommittedValue(params.state, params.state.posts, post.id);
+        if (rootPost) {
+            deleteCommittedValue(params.state, params.state.posts, rootPost.id);
+        }
+        params.state.nextPost = previousNextPost;
+        if (previousUser) {
+            setCommittedValue(params.state, params.state.users, senderId, previousUser);
+            params.state.userIdsByUsername.set(previousUser.username, senderId);
+        }
+        else {
+            deleteCommittedValue(params.state, params.state.users, senderId);
+        }
+        if (previousUser?.username !== senderName) {
+            params.state.userIdsByUsername.delete(senderName);
+        }
+        if (previousChannel) {
+            setCommittedValue(params.state, params.state.channels, channelId, previousChannel);
+        }
+        else {
+            deleteCommittedValue(params.state, params.state.channels, channelId);
+        }
+    };
+    if (!broadcast(params.state, event)) {
+        rollback();
+        return pendingQueueFullResponse(params.state);
+    }
+    return jsonResponse({ ok: true, post });
+}
+async function handleApi(params) {
+    const { body, method, path: apiPath, state } = params;
+    if (method === "GET" && apiPath === "/users/me") {
+        return jsonResponse(state.users.get(state.botUserId));
+    }
+    const usernameMatch = /^\/users\/username\/([^/]+)$/u.exec(apiPath);
+    if (method === "GET" && usernameMatch?.[1]) {
+        const username = decodeMattermostPathSegment(usernameMatch[1]);
+        if (username instanceof Response) {
+            return username;
+        }
+        const userId = state.userIdsByUsername.get(username.toLowerCase());
+        const user = userId ? state.users.get(userId) : undefined;
+        return user ? jsonResponse(user) : mattermostError("User not found", 404);
+    }
+    const userMatch = /^\/users\/([^/]+)$/u.exec(apiPath);
+    if (method === "GET" && userMatch?.[1]) {
+        const user = state.users.get(userMatch[1]);
+        return user ? jsonResponse(user) : mattermostError("User not found", 404);
+    }
+    const channelMatch = /^\/channels\/([^/]+)$/u.exec(apiPath);
+    if (method === "GET" && channelMatch?.[1]) {
+        const channel = state.channels.get(channelMatch[1]);
+        return channel ? jsonResponse(channel) : mattermostError("Channel not found", 404);
+    }
+    if (method === "POST" && apiPath === "/channels/direct") {
+        const userIds = Array.isArray(body) ? body.map(readMattermostId) : [];
+        if (userIds.length !== 2 || userIds.some((value) => !value)) {
+            return mattermostError("Two user IDs are required", 400);
+        }
+        const [firstUserId, secondUserId] = userIds;
+        if (firstUserId === secondUserId) {
+            return mattermostError("Direct channel users must be distinct", 400);
+        }
+        if (!state.users.has(firstUserId) || !state.users.has(secondUserId)) {
+            return mattermostError("User not found", 404);
+        }
+        if (firstUserId !== state.botUserId && secondUserId !== state.botUserId) {
+            return mattermostError("Authenticated user must belong to the direct channel", 403);
+        }
+        const channelName = mattermostDirectChannelName(firstUserId, secondUserId);
+        const existingChannel = findDirectChannel(state, channelName);
+        if (existingChannel) {
+            return jsonResponse(existingChannel, 201);
+        }
+        if (state.channels.size >= state.maxCommittedChannels) {
+            return mattermostError("Too many retained channels", 503);
+        }
+        const channelId = nextDirectChannelId(state, `dm:${channelName.replace("__", ":")}`);
+        const channel = { display_name: "", id: channelId, name: channelName, type: "D" };
+        if (!canRetainCommittedValues(state, [[undefined, channel]])) {
+            return mattermostError("Too much retained state", 503);
+        }
+        setCommittedValue(state, state.channels, channelId, channel);
+        return jsonResponse(channel, 201);
+    }
+    if (!isJsonObject(body)) {
+        return mattermostError("Request body must be a JSON object", 400);
+    }
+    if (method === "POST" && apiPath === "/users/me/typing") {
+        const channelId = readMattermostId(body.channel_id);
+        if (!channelId) {
+            return mattermostError("channel_id is required", 400);
+        }
+        if (body.parent_id !== undefined && typeof body.parent_id !== "string") {
+            return mattermostError("parent_id must be a string", 400);
+        }
+        if (!state.channels.has(channelId)) {
+            return mattermostError("Channel not found", 404);
+        }
+        const parentId = readMattermostId(body.parent_id);
+        broadcast(state, {
+            broadcast: eventBroadcast({
+                channelId,
+                omitUsers: { [state.botUserId]: true },
+            }),
+            data: {
+                channel_id: channelId,
+                ...(parentId ? { parent_id: parentId } : {}),
+                user_id: state.botUserId,
+            },
+            event: "typing",
+        }, false);
+        return jsonResponse({ status: "OK" });
+    }
+    if (method === "POST" && apiPath === "/posts") {
+        const channelId = readMattermostId(body.channel_id);
+        const message = readMattermostMessage(body.message);
+        if (!channelId || !message) {
+            return mattermostError("channel_id and message are required", 400);
+        }
+        const rootId = readMattermostId(body.root_id);
+        if (body.root_id !== undefined && typeof body.root_id !== "string") {
+            return mattermostError("root_id must be a string", 400);
+        }
+        const channel = state.channels.get(channelId);
+        if (!channel) {
+            return mattermostError("Channel not found", 404);
+        }
+        if (rootId) {
+            const rootPost = state.posts.get(rootId);
+            if (!rootPost) {
+                return mattermostError("Root post not found", 404);
+            }
+            if (rootPost.channel_id !== channelId) {
+                return mattermostError("Root post belongs to another channel", 400);
+            }
+            if (rootPost.root_id) {
+                return mattermostError("Root post is itself a reply", 400);
+            }
+        }
+        if (state.posts.size >= state.maxCommittedPosts) {
+            return mattermostError("Too many retained posts", 503);
+        }
+        const pendingPost = buildNextPost(state, {
+            channelId,
+            message,
+            rootId,
+            userId: state.botUserId,
+        });
+        const { post } = pendingPost;
+        if (!commitNextPostIfCapacity(state, pendingPost)) {
+            return mattermostError("Too much retained state", 503);
+        }
+        const event = postEvent("posted", post, state.botUsername, channel);
+        broadcast(state, event, false);
+        return jsonResponse(post, 201);
+    }
+    const postMatch = /^\/posts\/([^/]+)$/u.exec(apiPath);
+    if (postMatch?.[1] && method === "PUT") {
+        const post = state.posts.get(postMatch[1]);
+        if (!post) {
+            return mattermostError("Post not found", 404);
+        }
+        if (post.user_id !== state.botUserId) {
+            return mattermostError("You do not have permission to edit this post", 403);
+        }
+        const message = body.message === undefined ? post.message : readMattermostMessage(body.message);
+        if (!message) {
+            return mattermostError("message must be a string", 400);
+        }
+        const editedAt = Math.max(Date.now(), post.update_at + 1);
+        const updated = { ...post, edit_at: editedAt, message, update_at: editedAt };
+        if (!canRetainCommittedValues(state, [[post, updated]])) {
+            return mattermostError("Too much retained state", 503);
+        }
+        const event = postEvent("post_edited", updated, state.botUsername, state.channels.get(updated.channel_id));
+        if (webSocketEventBytes(event) > state.maxWebSocketBufferedBytes) {
+            return webSocketEventTooLargeResponse();
+        }
+        setCommittedValue(state, state.posts, updated.id, updated);
+        broadcast(state, event, false);
+        return jsonResponse(updated);
+    }
+    if (postMatch?.[1] && method === "DELETE") {
+        const post = state.posts.get(postMatch[1]);
+        if (!post) {
+            return mattermostError("Post not found", 404);
+        }
+        if (post.user_id !== state.botUserId) {
+            return mattermostError("You do not have permission to delete this post", 403);
+        }
+        const deletedAt = Math.max(Date.now(), post.update_at + 1);
+        const deletedPost = { ...post, delete_at: deletedAt, update_at: deletedAt };
+        const event = postEvent("post_deleted", deletedPost, state.botUsername, state.channels.get(deletedPost.channel_id));
+        if (webSocketEventBytes(event) > state.maxWebSocketBufferedBytes) {
+            return webSocketEventTooLargeResponse();
+        }
+        deleteCommittedValue(state, state.posts, post.id);
+        broadcast(state, event, false);
+        return jsonResponse({ status: "OK" });
+    }
+    return mattermostError("Not found", 404);
+}
+async function handleRequest(request, state) {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    const method = request.method ?? "GET";
+    const requestId = mattermostId(`request-${Date.now()}-${Math.random()}`);
+    if (url.pathname === "/crabline/mattermost/inbound" && method === "POST") {
+        if (!hasAdminToken(request, state.adminToken)) {
+            drainRequestBody(request);
+            return adminAuthError();
+        }
+        const body = await parseUnknownRequestBody(request);
+        if (!isJsonObject(body)) {
+            return jsonResponse({ error: "Request body must be a JSON object", ok: false }, 400);
+        }
+        await appendEvent(state, {
+            at: new Date().toISOString(),
+            body,
+            method,
+            path: url.pathname,
+            query: queryRecord(url),
+            type: "admin",
+        });
+        return handleAdminInbound({ body, state });
+    }
+    if (url.pathname !== "/api/v4" && !url.pathname.startsWith("/api/v4/")) {
+        drainRequestBody(request);
+        return mattermostError("Sorry, we could not find the page.", 404, {
+            id: "api.context.404.app_error",
+            requestId,
+        });
+    }
+    if (!authorized(request, state.botToken)) {
+        drainRequestBody(request);
+        return mattermostError("Invalid or expired session, please login again.", 401, {
+            id: "api.context.session_expired.app_error",
+            requestId,
+        });
+    }
+    const bodylessMethod = method === "GET" || method === "DELETE";
+    if (bodylessMethod) {
+        drainRequestBody(request);
+    }
+    const requiresJsonPost = method === "POST" && url.pathname === "/api/v4/posts" && !requestHasJsonMediaType(request);
+    if (requiresJsonPost) {
+        drainRequestBody(request);
+    }
+    const body = bodylessMethod || requiresJsonPost ? {} : await parseUnknownRequestBody(request);
+    const event = {
+        at: new Date().toISOString(),
+        ...(typeof body === "object" && body !== null && Object.keys(body).length > 0 ? { body } : {}),
+        method,
+        path: url.pathname,
+        query: queryRecord(url),
+        type: "api",
+    };
+    const response = requiresJsonPost
+        ? mattermostError("Content-Type must be application/json.", 415, {
+            id: "api.context.unsupported_content_type.app_error",
+            requestId,
+        })
+        : await handleApi({
+            body,
+            method,
+            path: url.pathname.slice("/api/v4".length),
+            state,
+        });
+    if (method === "POST" && url.pathname === "/api/v4/posts") {
+        event.accepted = response.status === 201;
+        const channelId = isJsonObject(body) ? readMattermostId(body.channel_id) : undefined;
+        event.channel = channelId ? state.channels.get(channelId) : undefined;
+    }
+    event.accepted ??= response.ok;
+    await appendEvent(state, event, response.ok && method !== "GET");
+    return response;
+}
+function attachWebSocketServer(params) {
+    const websocketServer = new WebSocketServer({
+        maxPayload: params.maxMessageBytes,
+        noServer: true,
+    });
+    const unauthenticatedClients = new Set();
+    const onUpgrade = (request, socket, head) => {
+        let url;
+        try {
+            url = new URL(request.url ?? "/", "http://localhost");
+        }
+        catch {
+            socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", () => socket.destroy());
+            return;
+        }
+        if (url.pathname !== "/api/v4/websocket") {
+            socket.destroy();
+            return;
+        }
+        websocketServer.handleUpgrade(request, socket, head, (client) => {
+            websocketServer.emit("connection", client, request);
+        });
+    };
+    params.server.on("upgrade", onUpgrade);
+    websocketServer.on("connection", (client) => {
+        client.on("error", () => {
+            unauthenticatedClients.delete(client);
+            params.state.websocketClients.delete(client);
+        });
+        if (unauthenticatedClients.size >= params.maxUnauthenticatedClients) {
+            client.terminate();
+            return;
+        }
+        unauthenticatedClients.add(client);
+        let authenticationOpen = true;
+        const authenticationTimeout = setTimeout(() => {
+            authenticationOpen = false;
+            client.close(4001, "authentication timeout");
+        }, params.authenticationTimeoutMs);
+        authenticationTimeout.unref();
+        client.on("message", (raw) => {
+            let message;
+            try {
+                message = JSON.parse(raw.toString());
+            }
+            catch {
+                client.close(1003, "invalid json");
+                return;
+            }
+            if (!isJsonObject(message)) {
+                client.close(1003, "invalid json");
+                return;
+            }
+            const seq = message.seq ?? 0;
+            if (!params.state.websocketClients.has(client)) {
+                if (!authenticationOpen || client.readyState !== WebSocket.OPEN) {
+                    return;
+                }
+                if (message.action !== "authentication_challenge" ||
+                    typeof message.data?.token !== "string" ||
+                    !constantTimeTokenEqual(message.data.token, params.state.botToken)) {
+                    sendControlMessage(params.state, client, {
+                        error: { id: "api.context.unauthorized", message: "Authentication failed" },
+                        seq_reply: seq,
+                        status: "FAIL",
+                    });
+                    authenticationOpen = false;
+                    client.close(4001, "authentication failed");
+                    return;
+                }
+                clearTimeout(authenticationTimeout);
+                authenticationOpen = false;
+                unauthenticatedClients.delete(client);
+                params.state.websocketClients.set(client, 0);
+                sendControlMessage(params.state, client, { seq_reply: seq, status: "OK" });
+                sendEvent(params.state, client, {
+                    broadcast: eventBroadcast({ userId: params.state.botUserId }),
+                    data: {
+                        connection_id: mattermostId(`connection-${Date.now()}-${Math.random()}`),
+                        server_version: "crabline-mattermost.1",
+                    },
+                    event: "hello",
+                });
+                const pending = params.state.pendingEvents.splice(0);
+                params.state.pendingEventBytes = 0;
+                for (const [index, event] of pending.entries()) {
+                    if (!sendEvent(params.state, client, event)) {
+                        const remaining = pending.slice(index);
+                        params.state.pendingEvents.unshift(...remaining);
+                        params.state.pendingEventBytes = remaining.reduce((total, queuedEvent) => total + retainedValueBytes(queuedEvent), 0);
+                        break;
+                    }
+                }
+                return;
+            }
+            if (message.action === "user_typing") {
+                const channelId = readMattermostId(message.data?.channel_id);
+                if (!channelId || !params.state.channels.has(channelId)) {
+                    sendControlMessage(params.state, client, {
+                        error: {
+                            id: "api.channel.get.find.app_error",
+                            message: "Channel not found",
+                        },
+                        seq_reply: seq,
+                        status: "FAIL",
+                    });
+                    return;
+                }
+                broadcast(params.state, {
+                    broadcast: eventBroadcast({
+                        channelId,
+                        omitUsers: { [params.state.botUserId]: true },
+                    }),
+                    data: {
+                        channel_id: channelId,
+                        parent_id: readMattermostId(message.data?.parent_id) ?? "",
+                        user_id: params.state.botUserId,
+                    },
+                    event: "typing",
+                }, false);
+                sendControlMessage(params.state, client, { seq_reply: seq, status: "OK" });
+                return;
+            }
+            if (message.action === "ping") {
+                sendControlMessage(params.state, client, {
+                    data: { text: "pong" },
+                    seq_reply: seq,
+                    status: "OK",
+                });
+                return;
+            }
+            sendControlMessage(params.state, client, {
+                error: { id: "api.websocket.invalid_action", message: "Unsupported action" },
+                seq_reply: seq,
+                status: "FAIL",
+            });
+        });
+        client.once("close", () => {
+            authenticationOpen = false;
+            clearTimeout(authenticationTimeout);
+            unauthenticatedClients.delete(client);
+            params.state.websocketClients.delete(client);
+        });
+    });
+    return async () => {
+        params.server.off("upgrade", onUpgrade);
+        await closeWebSocketServer(websocketServer);
+    };
+}
+export async function startMattermostServer(params = {}) {
+    const host = params.host ?? "127.0.0.1";
+    const botUserId = params.botUserId ?? mattermostId("crabline-mattermost-bot");
+    const botUsername = normalizeMattermostUsername(params.botUsername ?? "crabline_bot");
+    if (!botUsername) {
+        throw new Error("botUsername must be a valid Mattermost username.");
+    }
+    const maxWebSocketMessageBytes = resolvePositiveLimit(params.maxWebSocketMessageBytes, "maxWebSocketMessageBytes", DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES);
+    const maxUnauthenticatedWebSocketClients = resolvePositiveLimit(params.maxUnauthenticatedWebSocketClients, "maxUnauthenticatedWebSocketClients", DEFAULT_MAX_UNAUTHENTICATED_WEBSOCKET_CLIENTS);
+    const maxCommittedStateBytes = resolvePositiveLimit(params.maxCommittedStateBytes, "maxCommittedStateBytes", DEFAULT_MAX_COMMITTED_STATE_BYTES);
+    const botUser = { id: botUserId, update_at: Date.now(), username: botUsername };
+    const initialCommittedStateBytes = retainedValueBytes(botUser);
+    if (initialCommittedStateBytes > maxCommittedStateBytes) {
+        throw new Error("maxCommittedStateBytes cannot retain the configured bot user.");
+    }
+    const recorderPath = params.recorderPath ?? path.resolve(".crabline", "servers", "mattermost.jsonl");
+    const state = {
+        adminToken: params.adminToken ?? randomBytes(24).toString("base64url"),
+        botToken: params.botToken ??
+            (isLoopbackHost(host) ? "crabline-mattermost-token" : randomBytes(13).toString("hex")),
+        botUserId,
+        botUsername,
+        channels: new Map(),
+        committedStateBytes: initialCommittedStateBytes,
+        maxCommittedChannels: resolvePositiveLimit(params.maxCommittedChannels, "maxCommittedChannels", DEFAULT_MAX_COMMITTED_CHANNELS),
+        maxCommittedPosts: resolvePositiveLimit(params.maxCommittedPosts, "maxCommittedPosts", DEFAULT_MAX_COMMITTED_POSTS),
+        maxCommittedStateBytes,
+        maxCommittedUsers: resolvePositiveLimit(params.maxCommittedUsers, "maxCommittedUsers", DEFAULT_MAX_COMMITTED_USERS),
+        maxPendingInboundBytes: resolvePositiveLimit(params.maxPendingInboundBytes, "maxPendingInboundBytes", DEFAULT_MAX_PENDING_INBOUND_BYTES),
+        maxPendingInboundEvents: resolveMaxPendingInboundEvents(params.maxPendingInboundEvents),
+        maxWebSocketBufferedBytes: resolvePositiveLimit(params.maxWebSocketBufferedBytes, "maxWebSocketBufferedBytes", DEFAULT_MAX_WEBSOCKET_BUFFERED_BYTES),
+        nextPost: 1,
+        recorder: createServerRecorder({ recorderPath, onEvent: params.onEvent }),
+        pendingEventBytes: 0,
+        pendingEvents: [],
+        posts: new Map(),
+        recorderPath,
+        userIdsByUsername: new Map([[botUsername, botUserId]]),
+        users: new Map([[botUserId, botUser]]),
+        websocketClients: new Map(),
+    };
+    const httpServer = await startHttpJsonServer({
+        handle: (request) => handleRequest(request, state),
+        handleError: (error) => {
+            if (error instanceof InvalidJsonBodyError) {
+                return mattermostError("Request body is not valid JSON", 400);
+            }
+            if (error instanceof RequestBodyTooLargeError) {
+                return mattermostError("Request body is too large", 413);
+            }
+            return undefined;
+        },
+        host,
+        port: params.port ?? 0,
+        serverName: "Mattermost",
+    });
+    const closeMattermostWebSocketServer = attachWebSocketServer({
+        authenticationTimeoutMs: params.websocketAuthenticationTimeoutMs ?? DEFAULT_WEBSOCKET_AUTHENTICATION_TIMEOUT_MS,
+        maxMessageBytes: maxWebSocketMessageBytes,
+        maxUnauthenticatedClients: maxUnauthenticatedWebSocketClients,
+        server: httpServer.server,
+        state,
+    });
+    return {
+        close: createServerClose(state.recorder, closeMattermostWebSocketServer, () => httpServer.close()),
+        manifest: {
+            adminToken: state.adminToken,
+            baseUrl: httpServer.baseUrl,
+            botToken: state.botToken,
+            botUserId,
+            endpoints: {
+                adminInboundUrl: `${httpServer.baseUrl}/crabline/mattermost/inbound`,
+                apiRoot: `${httpServer.baseUrl}/api/v4`,
+                websocketUrl: `${httpServer.baseUrl.replace(/^http/u, "ws")}/api/v4/websocket`,
+            },
+            env: {
+                MATTERMOST_BOT_TOKEN: state.botToken,
+                MATTERMOST_URL: httpServer.baseUrl,
+            },
+            provider: "mattermost",
+            recorderPath: state.recorderPath,
+            version: 1,
+        },
+    };
+}
+//# sourceMappingURL=mattermost.js.map

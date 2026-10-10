@@ -1,0 +1,340 @@
+import { collectSlackAttachmentText, collectSlackBlockText } from "../slack-text.js";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import path from "node:path";
+import { CrablineError } from "../../core/errors.js";
+import { LocalMockProviderAdapter } from "../local-mock.js";
+import { slackTargetKey, SLACK_CHANNEL_ID_RULE, SLACK_EVENT_ID_RULE, SLACK_TS_RULE, SLACK_USER_ID_RULE, } from "../slack-ids.js";
+import { getBuiltinTargetCodec } from "../target-normalizers.js";
+import { genericMockPayloadWithNativeThread, isRecord, optionalRecord, optionalString, requireNativeInboundId, } from "./native-local-mock.js";
+import { requireExternalWebhookAuthentication } from "./external-webhook-auth.js";
+const SLACK_SIGNATURE_TOLERANCE_SECONDS = 5 * 60;
+const SLACK_EVENT_RETRY_RETENTION_HOURS = 25;
+const SLACK_EVENT_RATE_LIMIT_PER_HOUR = 30_000;
+const SLACK_EVENT_RETRY_RETENTION_MS = SLACK_EVENT_RETRY_RETENTION_HOURS * 60 * 60_000;
+const SLACK_EVENT_REPLAY_CACHE_LIMIT = SLACK_EVENT_RATE_LIMIT_PER_HOUR * SLACK_EVENT_RETRY_RETENTION_HOURS;
+export function resolveSlackAdapterConfig(config, env = process.env) {
+    const configuredSigningSecret = config.slack?.signingSecret;
+    const signingSecret = configuredSigningSecret ?? env.SLACK_SIGNING_SECRET;
+    if (signingSecret !== undefined && !signingSecret.trim()) {
+        throw new CrablineError(configuredSigningSecret === undefined
+            ? "SLACK_SIGNING_SECRET must not be empty or whitespace-only."
+            : "Slack signingSecret must not be empty or whitespace-only.", { kind: "config" });
+    }
+    return {
+        signingSecret,
+    };
+}
+function authenticateSlackWebhook(request, rawBody, signingSecret, now = Date.now) {
+    const timestamp = request.headers.get("x-slack-request-timestamp");
+    const signature = request.headers.get("x-slack-signature");
+    const timestampSeconds = timestamp ? Number(timestamp) : Number.NaN;
+    if (!timestamp ||
+        !signature ||
+        !Number.isSafeInteger(timestampSeconds) ||
+        Math.abs(now() / 1000 - timestampSeconds) > SLACK_SIGNATURE_TOLERANCE_SECONDS) {
+        return new Response("unauthorized", { status: 401 });
+    }
+    const expected = `v0=${createHmac("sha256", signingSecret)
+        .update(`v0:${timestamp}:${rawBody}`)
+        .digest("hex")}`;
+    const actualBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expected);
+    if (actualBuffer.length !== expectedBuffer.length ||
+        !timingSafeEqual(actualBuffer, expectedBuffer)) {
+        return new Response("unauthorized", { status: 401 });
+    }
+    return undefined;
+}
+function slackAuthorFromEvent(event) {
+    if (typeof event.bot_id === "string" || event.subtype === "bot_message") {
+        return "assistant";
+    }
+    return "user";
+}
+function slackMessageText(message) {
+    if (typeof message.text === "string" && message.text.trim()) {
+        return message.text;
+    }
+    const fallback = [];
+    collectSlackBlockText(message.blocks, fallback);
+    collectSlackAttachmentText(message.attachments, fallback);
+    return fallback.length > 0 ? fallback.join("\n") : undefined;
+}
+function hasMalformedSlackMessageContent(message) {
+    return ((message.text !== undefined && typeof message.text !== "string") ||
+        (message.blocks !== undefined && !Array.isArray(message.blocks)) ||
+        (message.attachments !== undefined && !Array.isArray(message.attachments)));
+}
+export function normalizeSlackEventsPayload(payload) {
+    if (!isRecord(payload)) {
+        throw new CrablineError("Slack webhook payload must be an object", { kind: "inbound" });
+    }
+    const { token: _token, ...safePayload } = payload;
+    if (isRecord(payload.event)) {
+        const event = payload.event;
+        const isMessageChanged = event.subtype === "message_changed";
+        const changedMessage = isRecord(event.message) ? event.message : undefined;
+        if (isMessageChanged && !changedMessage) {
+            throw new CrablineError("Slack message_changed event requires event.message", {
+                kind: "inbound",
+            });
+        }
+        const message = isMessageChanged ? changedMessage : event;
+        if (!message || hasMalformedSlackMessageContent(message)) {
+            throw new CrablineError("Slack event payload contains malformed message content", {
+                kind: "inbound",
+            });
+        }
+        const channel = event.channel;
+        const text = slackMessageText(message);
+        if (typeof channel !== "string" || text === undefined) {
+            throw new CrablineError("Slack event payload requires event.channel and event.text", {
+                kind: "inbound",
+            });
+        }
+        const threadTs = message.thread_ts;
+        const callbackEventId = optionalString(payload, "event_id");
+        const eventId = callbackEventId ??
+            (isMessageChanged ? optionalString(event, "event_ts") : optionalString(message, "ts"));
+        return {
+            author: slackAuthorFromEvent(message),
+            ...(eventId
+                ? {
+                    id: requireNativeInboundId(eventId, callbackEventId ? SLACK_EVENT_ID_RULE : SLACK_TS_RULE, callbackEventId ? "Slack event_id" : "Slack event timestamp"),
+                }
+                : {}),
+            raw: safePayload,
+            text,
+            threadId: typeof threadTs === "string"
+                ? slackTargetKey(requireNativeInboundId(channel, SLACK_CHANNEL_ID_RULE, "Slack event.channel"), requireNativeInboundId(threadTs, SLACK_TS_RULE, "Slack event.thread_ts"))
+                : requireNativeInboundId(channel, SLACK_CHANNEL_ID_RULE, "Slack event.channel"),
+        };
+    }
+    const normalized = genericMockPayloadWithNativeThread({
+        channelRule: SLACK_CHANNEL_ID_RULE,
+        payload: safePayload,
+        threadRule: SLACK_TS_RULE,
+    });
+    const message = isRecord(payload.message) ? payload.message : undefined;
+    const channelId = (message ? optionalString(message, "channelId") : undefined) ??
+        optionalString(payload, "channelId") ??
+        optionalString(payload, "channel");
+    const threadId = (message ? optionalString(message, "threadId") : undefined) ??
+        optionalString(payload, "threadId");
+    if (threadId && SLACK_TS_RULE.pattern.test(threadId) && !channelId) {
+        throw new CrablineError("Slack timestamp threadId requires a native channelId", {
+            kind: "inbound",
+        });
+    }
+    if (!channelId || !threadId || !SLACK_TS_RULE.pattern.test(threadId)) {
+        return normalized;
+    }
+    const scopedThreadId = slackTargetKey(requireNativeInboundId(channelId, SLACK_CHANNEL_ID_RULE, "Slack channelId"), threadId);
+    return {
+        ...normalized,
+        ...("message" in normalized && isRecord(normalized.message)
+            ? { message: { ...normalized.message, threadId: scopedThreadId } }
+            : {}),
+        threadId: scopedThreadId,
+    };
+}
+function matchesSlackThread(candidateThreadId, expectedThreadId, target, raw) {
+    if (!expectedThreadId) {
+        return true;
+    }
+    const scopedExpectedThreadId = target.channelId && SLACK_TS_RULE.pattern.test(expectedThreadId)
+        ? slackTargetKey(target.channelId, expectedThreadId)
+        : expectedThreadId;
+    if (candidateThreadId === scopedExpectedThreadId ||
+        candidateThreadId.startsWith(`${scopedExpectedThreadId}:`)) {
+        return true;
+    }
+    if (!target.channelId || !SLACK_USER_ID_RULE.pattern.test(target.channelId) || !isRecord(raw)) {
+        return false;
+    }
+    const event = optionalRecord(raw, "event");
+    const message = event?.subtype === "message_changed" ? optionalRecord(event, "message") : event;
+    const channel = event ? optionalString(event, "channel") : undefined;
+    const user = (event ? optionalString(event, "user") : undefined) ??
+        (message ? optionalString(message, "user") : undefined);
+    if (!channel?.startsWith("D") || user !== target.channelId) {
+        return false;
+    }
+    if (expectedThreadId === target.channelId) {
+        return candidateThreadId === channel || candidateThreadId.startsWith(`${channel}:thread:`);
+    }
+    const messageThreadTs = message ? optionalString(message, "thread_ts") : undefined;
+    return Boolean(SLACK_TS_RULE.pattern.test(expectedThreadId) &&
+        messageThreadTs === expectedThreadId &&
+        candidateThreadId === slackTargetKey(channel, expectedThreadId));
+}
+export function handleSlackWebhookPayload(payload) {
+    if (!isRecord(payload)) {
+        return undefined;
+    }
+    if (payload.type === "url_verification" && typeof payload.challenge === "string") {
+        return Response.json({ challenge: payload.challenge });
+    }
+    if (payload.type === "event_callback") {
+        if (!isRecord(payload.event)) {
+            return undefined;
+        }
+        const eventType = optionalString(payload.event, "type");
+        if (!eventType) {
+            return new Response(null, { status: 200 });
+        }
+        if (eventType !== "message" && eventType !== "app_mention") {
+            return new Response(null, { status: 200 });
+        }
+        const isMessageChanged = payload.event.subtype === "message_changed";
+        if (isMessageChanged && !isRecord(payload.event.message)) {
+            return undefined;
+        }
+        const message = isMessageChanged ? payload.event.message : payload.event;
+        if (!isRecord(message)) {
+            return undefined;
+        }
+        if (typeof payload.event.channel !== "string" || hasMalformedSlackMessageContent(message)) {
+            return undefined;
+        }
+        if (slackMessageText(message) === undefined) {
+            return new Response(null, { status: 200 });
+        }
+        return undefined;
+    }
+    if (typeof payload.type === "string" && payload.type.trim()) {
+        return new Response(null, { status: 200 });
+    }
+    return undefined;
+}
+async function handleSlackEventReplay(payload, state) {
+    if (!isRecord(payload) || payload.type !== "event_callback") {
+        return undefined;
+    }
+    const eventId = optionalString(payload, "event_id");
+    if (!eventId || !SLACK_EVENT_ID_RULE.pattern.test(eventId)) {
+        return undefined;
+    }
+    const now = state.now();
+    pruneSlackEventReplayState(state, now);
+    for (;;) {
+        if (state.accepted.has(eventId)) {
+            return new Response(null, { status: 200 });
+        }
+        const pending = state.inFlight.get(eventId);
+        if (!pending) {
+            if (state.accepted.size + state.inFlight.size >= state.cacheLimit) {
+                return slackEventReplayCapacityResponse();
+            }
+            reserveSlackEvent(state, eventId);
+            return undefined;
+        }
+        if (await pending.promise) {
+            return new Response(null, { status: 200 });
+        }
+    }
+}
+function reserveSlackEvent(state, eventId) {
+    let resolveReservation;
+    const promise = new Promise((resolve) => {
+        resolveReservation = resolve;
+    });
+    state.inFlight.set(eventId, {
+        promise,
+        resolve: resolveReservation,
+    });
+}
+function settleSlackEventReplay(state, payload, accepted) {
+    if (!isRecord(payload)) {
+        return;
+    }
+    const eventId = optionalString(payload, "event_id");
+    if (!eventId) {
+        return;
+    }
+    const reservation = state.inFlight.get(eventId);
+    if (!reservation) {
+        return;
+    }
+    state.inFlight.delete(eventId);
+    if (accepted) {
+        const expiresAt = state.now() + SLACK_EVENT_RETRY_RETENTION_MS;
+        state.accepted.set(eventId, expiresAt);
+        state.expiryQueue.push({ eventId, expiresAt });
+    }
+    reservation.resolve(accepted);
+}
+function pruneSlackEventReplayState(state, now) {
+    while (state.expiryHead < state.expiryQueue.length) {
+        const { eventId, expiresAt } = state.expiryQueue[state.expiryHead];
+        if (now <= expiresAt) {
+            break;
+        }
+        state.expiryHead += 1;
+        if (state.accepted.get(eventId) === expiresAt) {
+            state.accepted.delete(eventId);
+        }
+    }
+    if (state.expiryHead >= 1_024 && state.expiryHead * 2 >= state.expiryQueue.length) {
+        state.expiryQueue = state.expiryQueue.slice(state.expiryHead);
+        state.expiryHead = 0;
+    }
+}
+function slackEventReplayCapacityResponse() {
+    return new Response("service unavailable", {
+        headers: { "cache-control": "no-store" },
+        status: 503,
+    });
+}
+export class SlackProviderAdapter extends LocalMockProviderAdapter {
+    constructor(id, config, _userName, runtime) {
+        const slackRuntime = runtime ?? {};
+        const resolvedConfig = resolveSlackAdapterConfig(config);
+        requireExternalWebhookAuthentication({
+            authenticated: Boolean(resolvedConfig.signingSecret),
+            provider: "Slack",
+            requirement: "slack.signingSecret or SLACK_SIGNING_SECRET",
+            webhook: config.slack?.webhook,
+        });
+        const replayState = {
+            accepted: new Map(),
+            cacheLimit: slackRuntime.replayCacheLimit ?? SLACK_EVENT_REPLAY_CACHE_LIMIT,
+            expiryHead: 0,
+            expiryQueue: [],
+            inFlight: new Map(),
+            now: slackRuntime.now ?? (() => Date.now()),
+        };
+        super({
+            codec: getBuiltinTargetCodec("slack"),
+            config,
+            id,
+            options: {
+                ...(resolvedConfig.signingSecret
+                    ? {
+                        authenticateWebhookRequest(request, rawBody) {
+                            return authenticateSlackWebhook(request, rawBody, resolvedConfig.signingSecret, replayState.now);
+                        },
+                    }
+                    : {}),
+                defaultWebhook: { host: "127.0.0.1", path: "/slack/events", port: 8787 },
+                endpointLabel: "events endpoint",
+                async handleWebhookPayload(payload) {
+                    return (handleSlackWebhookPayload(payload) ??
+                        (await handleSlackEventReplay(payload, replayState)));
+                },
+                matchesThread: matchesSlackThread,
+                normalizeWebhookPayload: normalizeSlackEventsPayload,
+                platform: "slack",
+                publicUrl: config.slack?.webhook.publicUrl,
+                recorderPath: config.slack?.recorder.path
+                    ? path.resolve(config.slack.recorder.path)
+                    : undefined,
+                settleWebhookRequest({ accepted, payload }) {
+                    settleSlackEventReplay(replayState, payload, accepted);
+                },
+                webhook: config.slack?.webhook,
+            },
+        });
+    }
+}
+//# sourceMappingURL=slack.js.map
