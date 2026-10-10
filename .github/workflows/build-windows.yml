@@ -82,6 +82,7 @@ jobs:
           pnpm build
           node scripts/package-openclaw-for-docker.mjs \
             --skip-build --allow-unreleased-changelog \
+            --output-dir . \
             --output-name "openclaw-$(node -p "require('./package.json').version").tgz"
           ls -la openclaw-*.tgz
           node scripts/check-openclaw-package-tarball.mjs --require-bundled-workspace-deps \
