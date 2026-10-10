@@ -11,6 +11,11 @@ import { resolveTsxImport } from "./tsx-cli-shim.mjs";
 import { resolveWorkerDeployGeneratorInputs } from "./worker-deploy-build-plugin.mts";
 
 const sourceFilePattern = /\.(?:[cm]?[jt]sx?)$/u;
+// External `@openclaw/*` libraries vendored into `packages/` keep their prebuilt
+// `dist` verbatim. Their computed native `require()` edges are runtime concerns,
+// not declaration-generator inputs, so the graph must not descend into them.
+const isVendoredDistFile = (portable: string) =>
+  /^packages\/(?:fs-safe|proxyline|crabline)\/dist\//u.test(portable);
 const builtins = new Set([...builtinModules, ...builtinModules.map((name) => `node:${name}`)]);
 const portablePath = (root: string, file: string) => {
   const relative = path.relative(root, file);
@@ -112,6 +117,9 @@ export function resolveTsdownDeclarationGeneratorInputs(rootDir: string, generat
     const absolute = fs.realpathSync(path.resolve(root, requested));
     const id = portablePath(root, absolute);
     files.set(id, absolute);
+    if (isVendoredDistFile(id)) {
+      return;
+    }
     if (
       compilerSource ||
       visited.has(id) ||
