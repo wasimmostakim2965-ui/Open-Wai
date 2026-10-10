@@ -44,6 +44,18 @@ const POST_FORCE_KILL_WAIT_MS = 1_000;
 const DEFAULT_CAPTURED_STDOUT_MAX_BYTES = 1024 * 1024;
 const AI_RUNTIME_PACKAGE = "@openclaw/ai";
 const AI_RUNTIME_BACKUP_DIR = ".openclaw-ai-package-backup";
+// External libraries vendored into packages/ and shipped from this repo. They are
+// workspace:* dependencies, so pnpm links them (and their transitive deps) into
+// node_modules as symlinks. `npm pack` on such a symlinked tree emits the
+// isolated-store path (node_modules/.pnpm/...) instead of the nested path it
+// computes from a real directory, which fails the tarball inventory check. Stage
+// them as real copies (mirroring how the @openclaw/ai runtime is materialized)
+// and rewrite the workspace protocol to the concrete version.
+const VENDORED_WORKSPACE_PACKAGES = [
+  { dir: "fs-safe", package: "@openclaw/fs-safe" },
+  { dir: "proxyline", package: "@openclaw/proxyline" },
+] as const;
+const VENDORED_BACKUP_PREFIX = ".openclaw-vendored-package-backup";
 
 type KillChild = (signal: NodeJS.Signals) => void;
 type RunOptions = {
@@ -752,6 +764,181 @@ export async function prepareBundledAiRuntimePackage(
   }
 }
 
+// Copy `src` to `dest`, resolving every symlink (including nested pnpm dependency
+// links) into a real file/directory. Cycle-safe via the set of already-visited
+// real directories along the current recursion path.
+async function copyDereferencedTree(
+  src: string,
+  dest: string,
+  ancestors: ReadonlySet<string>,
+): Promise<void> {
+  const stats = await fs.lstat(src);
+  if (stats.isSymbolicLink()) {
+    const real = await fs.realpath(src);
+    if (ancestors.has(real)) {
+      return;
+    }
+    const realStats = await fs.stat(real);
+    if (realStats.isDirectory()) {
+      await copyDereferencedDirectory(real, dest, ancestors);
+    } else {
+      await fs.copyFile(real, dest);
+    }
+    return;
+  }
+  if (stats.isDirectory()) {
+    await copyDereferencedDirectory(src, dest, ancestors);
+    return;
+  }
+  if (stats.isFile()) {
+    await fs.copyFile(src, dest);
+  }
+}
+
+async function copyDereferencedDirectory(
+  src: string,
+  dest: string,
+  ancestors: ReadonlySet<string>,
+): Promise<void> {
+  await fs.mkdir(dest, { recursive: true });
+  const real = await fs.realpath(src);
+  const nextAncestors = new Set(ancestors).add(real);
+  for (const entry of await fs.readdir(src, { withFileTypes: true })) {
+    await copyDereferencedTree(
+      path.join(src, entry.name),
+      path.join(dest, entry.name),
+      nextAncestors,
+    );
+  }
+}
+
+// Materialize the vendored `@openclaw/*` workspace packages as real directories
+// (dereferencing the pnpm symlinks and their nested dependency links) and rewrite
+// their `workspace:*` dependency specifiers to the concrete version, so `npm pack`
+// bundles them at `node_modules/@openclaw/<name>/...` and the root manifest no
+// longer carries the workspace protocol. Returns a cleanup handle that restores
+// the original symlinks.
+async function prepareBundledVendoredPackages(
+  sourceDir: string,
+  onCleanupFailure: (error: unknown) => void,
+): Promise<() => Promise<void>> {
+  const packageJsonPath = path.join(sourceDir, "package.json");
+  const originalPackageJson = await fs.readFile(packageJsonPath, "utf8");
+  const packageJson = JSON.parse(originalPackageJson) as MutableJsonRecord & {
+    dependencies?: Record<string, unknown>;
+    optionalDependencies?: Record<string, unknown>;
+    peerDependencies?: Record<string, unknown>;
+    devDependencies?: Record<string, unknown>;
+  };
+  const sections = [
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+    "devDependencies",
+  ] as const;
+  const bundled: Array<{ dir: string; package: string }> = [];
+  for (const { dir, package: pkg } of VENDORED_WORKSPACE_PACKAGES) {
+    const spec = sections
+      .map((section) => packageJson[section]?.[pkg])
+      .find((value): value is string => typeof value === "string");
+    if (spec?.startsWith("workspace:") && packageJson.dependencies?.[pkg] !== undefined) {
+      bundled.push({ dir, package: pkg });
+    }
+  }
+  if (bundled.length === 0) {
+    return async () => {};
+  }
+  const backups = new Map<string, string>();
+  const rewrittenVersions: Record<string, string> = {};
+  for (const { dir, package: pkg } of bundled) {
+    const sourceVersion = JSON.parse(
+      await fs.readFile(path.join(sourceDir, "packages", dir, "package.json"), "utf8"),
+    ).version;
+    if (typeof sourceVersion !== "string" || !sourceVersion) {
+      throw new Error(`vendored package ${pkg} must declare a version`);
+    }
+    rewrittenVersions[pkg] = sourceVersion;
+  }
+  const restorePackageJson = async () => {
+    await fs.writeFile(packageJsonPath, originalPackageJson);
+  };
+  let packageJsonChanged = false;
+  const cleanup = async (): Promise<void> => {
+    let cleanupError: unknown;
+    const attempt = async (action: () => Promise<unknown>): Promise<void> => {
+      try {
+        await action();
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    };
+    if (packageJsonChanged) {
+      await attempt(restorePackageJson);
+    }
+    for (const [dirName, backupPath] of backups) {
+      await attempt(async () => {
+        await fs.rm(path.join(sourceDir, "node_modules", "@openclaw", dirName), {
+          force: true,
+          recursive: true,
+        });
+        await fs.rename(backupPath, path.join(sourceDir, "node_modules", "@openclaw", dirName));
+      });
+    }
+    backups.clear();
+    packageJsonChanged = false;
+    if (cleanupError) {
+      onCleanupFailure(cleanupError);
+      throw toErrorObject(cleanupError, "Vendored package cleanup failed.");
+    }
+  };
+
+  try {
+    for (const { dir, package: pkg } of bundled) {
+      const sourcePath = path.join(sourceDir, "packages", dir);
+      const linkPath = path.join(sourceDir, "node_modules", "@openclaw", dir);
+      const backupPath = `${linkPath}${VENDORED_BACKUP_PREFIX}`;
+      await fs.access(backupPath).then(
+        () => {
+          throw new Error(`refusing to overwrite existing ${backupPath}`);
+        },
+        (error: unknown) => {
+          if (!hasErrorCode(error, "ENOENT")) {
+            throw error;
+          }
+        },
+      );
+      try {
+        await fs.readlink(linkPath);
+      } catch (error) {
+        if (!hasErrorCode(error, "EINVAL") && !hasErrorCode(error, "ENOENT")) {
+          throw error;
+        }
+      }
+      await fs.rename(linkPath, backupPath);
+      backups.set(dir, backupPath);
+      await fs.mkdir(linkPath, { recursive: true });
+      const sourceReal = await fs.realpath(sourcePath);
+      const ancestors = new Set<string>([sourceReal]);
+      for (const entry of await fs.readdir(sourcePath, { withFileTypes: true })) {
+        await copyDereferencedTree(
+          path.join(sourcePath, entry.name),
+          path.join(linkPath, entry.name),
+          ancestors,
+        );
+      }
+    }
+    for (const { package: pkg } of bundled) {
+      packageJson.dependencies![pkg] = rewrittenVersions[pkg];
+    }
+    packageJsonChanged = true;
+    await fs.writeFile(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+    return cleanup;
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
 async function normalizeOpenClawTarballModes(tarballPath: string) {
   // npm can retain restrictive source read bits. Normalize those for non-root
   // installers while preserving the archive's executable intent. pnpm derives
@@ -922,6 +1109,7 @@ export async function packOpenClawPackageForDocker(
   let packReceiptDir: string | undefined;
   try {
     let cleanupBundledAiRuntime = async () => {};
+    let cleanupBundledVendoredPackages = async () => {};
     let cleanupBundledPlugins = async () => {};
     const cleanupFailures = new Set<unknown>();
     const onCleanupFailure = (error: unknown) => void cleanupFailures.add(error);
@@ -944,6 +1132,10 @@ export async function packOpenClawPackageForDocker(
           restoreManifest,
           onCleanupFailure,
         },
+      );
+      cleanupBundledVendoredPackages = await prepareBundledVendoredPackages(
+        sourcePath,
+        onCleanupFailure,
       );
       // AI staging materializes the bundled tree; pack must not inherit the
       // source workspace's isolated linker setting for that prepared bundle.
@@ -969,7 +1161,11 @@ export async function packOpenClawPackageForDocker(
     } finally {
       // Restore shared manifests in reverse preparation order. A helper can
       // fail restoring during preparation, before its cleanup handle returns.
-      for (const cleanup of [cleanupBundledAiRuntime, cleanupBundledPlugins]) {
+      for (const cleanup of [
+        cleanupBundledVendoredPackages,
+        cleanupBundledAiRuntime,
+        cleanupBundledPlugins,
+      ]) {
         try {
           await cleanup();
         } catch (error) {
