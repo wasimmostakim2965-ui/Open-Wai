@@ -106,9 +106,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $app = "${{ steps.install.outputs.app }}"
-          $exe = Get-ChildItem -LiteralPath $app -Recurse -Filter "OpenClaw.exe" -ErrorAction SilentlyContinue |
+          # The desktop binary is `openclaw-desktop.exe`; fall back to any exe
+          # that is not the uninstaller so a rename cannot silently skip the run.
+          $exe = Get-ChildItem -LiteralPath $app -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch 'uninstall' } |
+            Sort-Object { if ($_.Name -eq 'openclaw-desktop.exe') { 0 } else { 1 } } |
             Select-Object -First 1
-          if (-not $exe) { throw "No OpenClaw.exe under $app." }
+          if (-not $exe) { throw "No application .exe under $app." }
           Write-Host "launching $($exe.FullName)"
           # First run extracts the bundled runtime and starts the Gateway, which
           # can take a few minutes on a cold runner. Do not wait here; poll below.
