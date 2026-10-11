@@ -2319,9 +2319,13 @@ function Set-OpenClawLocalGatewayDefaults {
         return
     }
 
-    $batch = '[{"path":"gateway.mode","value":"local"},{"path":"gateway.bind","value":"loopback"},{"path":"gateway.auth.mode","value":"none"}]'
+    # Positional `config set <path> <value>` avoids passing raw JSON through
+    # Windows PowerShell 5.1, which mangles the quotes in a `--batch-json`
+    # argument and silently fails the whole batch.
     try {
-        Invoke-OpenClawCommand config set --batch-json $batch | Out-Null
+        Invoke-OpenClawCommand config set gateway.mode local | Out-Null
+        Invoke-OpenClawCommand config set gateway.bind loopback | Out-Null
+        Invoke-OpenClawCommand config set gateway.auth.mode none | Out-Null
         Write-Host "[OK] Gateway set for local single-user chat" -ForegroundColor Green
     } catch {
         Write-Host "[!] Could not set local gateway defaults; continuing." -ForegroundColor Yellow

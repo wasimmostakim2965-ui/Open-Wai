@@ -181,15 +181,22 @@ jobs:
             Select-Object -First 1
           if (-not $cli) { throw "No openclaw.cmd under $root." }
           $env:OPENCLAW_NO_UPDATE_CHECK = "1"
-          $mode = (& $cli.FullName config get gateway.auth.mode 2>&1 | Out-String).Trim()
-          $bind = (& $cli.FullName config get gateway.bind 2>&1 | Out-String).Trim()
-          Write-Host "gateway.auth.mode -> $mode"
-          Write-Host "gateway.bind      -> $bind"
-          # A loopback, no-auth gateway lets the local browser auto-pair and land
-          # in chat; anything else shows the token/setup gate.
-          if ($mode -notmatch 'none') { throw "Expected gateway.auth.mode=none for a desktop install, got: $mode" }
-          if ($bind -notmatch 'loopback') { throw "Expected gateway.bind=loopback for a desktop install, got: $bind" }
-          Write-Host "Desktop install is configured to open chat directly."
+
+          # `dashboard --json` is exactly what the desktop shell calls to open the
+          # UI. A successful response carrying a one-time `bootstrapToken` browser
+          # URL is what lands the window in chat; without it the UI shows the
+          # token/setup gate. Assert that contract, not a guessed auth mode.
+          $raw = (& $cli.FullName dashboard --json --no-open 2>&1 | Out-String).Trim()
+          Write-Host "dashboard -> $raw"
+          $dashboard = $raw | ConvertFrom-Json
+          if (-not $dashboard.ok) {
+            throw "The desktop dashboard integration is not available: $($dashboard.reason)"
+          }
+          if (-not $dashboard.browserUrl) { throw "The dashboard response had no browserUrl." }
+          if ($dashboard.browserUrl -notmatch 'bootstrapToken=') {
+            throw "The dashboard URL carries no bootstrap token; the UI would show the token gate."
+          }
+          Write-Host "Desktop install opens chat directly (bootstrap URL present)."
 
       - name: Capture screenshot evidence
         if: always()
