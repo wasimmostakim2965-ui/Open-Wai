@@ -301,6 +301,29 @@ COPY --from=runtime-assets --chown=node:node /app/skills ./skills
 COPY --from=runtime-assets --chown=node:node /app/docs ./docs
 COPY --from=runtime-assets --chown=node:node /app/qa ./qa
 COPY --from=dependency-inputs /app/scripts/docker/verify-fs-safe-native.mjs /tmp/verify-fs-safe-native.mjs
+
+# The runtime image ships prebuilt workspace packages instead of building them,
+# so pnpm never installs fs-safe's precompiled platform addon. Fetch the matching
+# platform package directly (same version as the vendored fs-safe package).
+RUN set -eu; \
+    ver="$(node -p "require('/app/node_modules/@openclaw/fs-safe/package.json').version")"; \
+    case "$(node -p 'process.arch')" in \
+      x64) pkg='@openclaw/fs-safe-linux-x64-gnu' ;; \
+      arm64) pkg='@openclaw/fs-safe-linux-arm64-gnu' ;; \
+      *) pkg='' ;; \
+    esac; \
+    if [ -n "$pkg" ]; then \
+      name="${pkg##*/}"; \
+      url="https://registry.npmjs.org/${pkg}/-/${name}-${ver}.tgz"; \
+      tmp="$(mktemp -d)"; \
+      curl -fsSL "$url" -o "$tmp/pkg.tgz"; \
+      tar -xzf "$tmp/pkg.tgz" -C "$tmp"; \
+      rm -rf "/app/node_modules/${pkg}"; \
+      mkdir -p "/app/node_modules/$(dirname "$pkg")"; \
+      mv "$tmp/package" "/app/node_modules/${pkg}"; \
+      rm -rf "$tmp"; \
+      chown -R node:node "/app/node_modules/${pkg}"; \
+    fi
 RUN node /tmp/verify-fs-safe-native.mjs --package-root /app --mode require
 
 # Validate the three version surfaces in every release-built runtime variant.
