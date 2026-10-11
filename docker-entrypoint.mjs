@@ -90,10 +90,30 @@ try {
     // scripts/docker/setup.sh, so nothing pins the local gateway mode. Without
     // it the gateway refuses to start ("existing config is missing gateway.mode").
     // Pin it here, mirroring setup.sh, before doctor and the gateway read config.
-    const configBatch = JSON.stringify([
+    const configPaths = [
       { path: "gateway.mode", value: "local" },
       { path: "gateway.bind", value: process.env.OPENCLAW_GATEWAY_BIND ?? "lan" },
-    ]);
+    ];
+    // A hosting platform terminates TLS and forwards the request. The gateway
+    // rejects forwarded traffic unless the proxy hop is trusted, so operators
+    // declare it here (comma-separated CIDRs) instead of editing config by hand.
+    const trustedProxies = process.env.OPENCLAW_TRUSTED_PROXIES;
+    if (trustedProxies) {
+      configPaths.push({
+        path: "gateway.trustedProxies",
+        value: trustedProxies
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean),
+      });
+    }
+    // The Control UI refuses browser origins it does not know; hosted UIs sit on
+    // the platform domain, not localhost.
+    const publicOrigin = process.env.OPENCLAW_PUBLIC_ORIGIN;
+    if (publicOrigin) {
+      configPaths.push({ path: "gateway.controlUi.allowedOrigins", value: [publicOrigin] });
+    }
+    const configBatch = JSON.stringify(configPaths);
     await new Promise((resolve) => {
       const configChild = spawn(
         process.execPath,
