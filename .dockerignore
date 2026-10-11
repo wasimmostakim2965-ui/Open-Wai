@@ -76,3 +76,15 @@ vendor/
 !vendor/a2ui/renderers/
 !vendor/a2ui/renderers/lit/
 !vendor/a2ui/renderers/lit/**
+
+# The fork vendors some workspace packages with their built dist committed
+# (packages/fs-safe, packages/proxyline, packages/crabline). The global
+# `dist` / `**/dist` rules above would drop them, but the Docker build only
+# ships package manifests for workspace packages, so these prebuilt dists are
+# the only source available and must stay in the build context.
+!packages/fs-safe/dist/
+!packages/fs-safe/dist/**
+!packages/proxyline/dist/
+!packages/proxyline/dist/**
+!packages/crabline/dist/
+!packages/crabline/dist/**

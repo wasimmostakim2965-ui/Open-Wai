@@ -47,6 +47,9 @@ RUN mkdir -p /out/packages "/out/${OPENCLAW_BUNDLED_PLUGIN_DIR}" && \
       pkg_name="${pkg_dir##*/}"; \
       mkdir -p "/out/packages/$pkg_name" && \
       cp "$manifest" "/out/packages/$pkg_name/package.json"; \
+      if [ -d "$pkg_dir/dist" ]; then \
+        cp -R "$pkg_dir/dist" "/out/packages/$pkg_name/dist"; \
+      fi; \
     done && \
     node /tmp/docker-plugin-selection.mjs "/tmp/${OPENCLAW_BUNDLED_PLUGIN_DIR}" "$OPENCLAW_EXTENSIONS" \
       > /out/openclaw-selected-plugin-dirs && \
