@@ -172,6 +172,25 @@ jobs:
           Write-Host "openclaw --version -> $version"
           if (-not ($version -match '\d+\.\d+')) { throw "The bundled CLI did not report a version: $version" }
 
+      - name: Prove the app opens straight into chat (no token gate)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:USERPROFILE ".openclaw\tools"
+          $cli = Get-ChildItem -LiteralPath $root -Recurse -Filter openclaw.cmd -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $cli) { throw "No openclaw.cmd under $root." }
+          $env:OPENCLAW_NO_UPDATE_CHECK = "1"
+          $mode = (& $cli.FullName config get gateway.auth.mode 2>&1 | Out-String).Trim()
+          $bind = (& $cli.FullName config get gateway.bind 2>&1 | Out-String).Trim()
+          Write-Host "gateway.auth.mode -> $mode"
+          Write-Host "gateway.bind      -> $bind"
+          # A loopback, no-auth gateway lets the local browser auto-pair and land
+          # in chat; anything else shows the token/setup gate.
+          if ($mode -notmatch 'none') { throw "Expected gateway.auth.mode=none for a desktop install, got: $mode" }
+          if ($bind -notmatch 'loopback') { throw "Expected gateway.bind=loopback for a desktop install, got: $bind" }
+          Write-Host "Desktop install is configured to open chat directly."
+
       - name: Capture screenshot evidence
         if: always()
         shell: pwsh

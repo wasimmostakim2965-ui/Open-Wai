@@ -2310,6 +2310,24 @@ function Refresh-GatewayServiceIfLoaded {
     }
 }
 
+# A desktop install opens the Control UI on this same machine. Pinning a loopback
+# bind with no gateway auth lets the local browser auto-pair and land straight in
+# chat, instead of stopping on the token/setup gate. Hosted/lan setups must keep
+# their own auth and do not use this path.
+function Set-OpenClawLocalGatewayDefaults {
+    if (-not (Get-OpenClawCommandPath)) {
+        return
+    }
+
+    $batch = '[{"path":"gateway.mode","value":"local"},{"path":"gateway.bind","value":"loopback"},{"path":"gateway.auth.mode","value":"none"}]'
+    try {
+        Invoke-OpenClawCommand config set --batch-json $batch | Out-Null
+        Write-Host "[OK] Gateway set for local single-user chat" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] Could not set local gateway defaults; continuing." -ForegroundColor Yellow
+    }
+}
+
 function Get-LegacyRepoDir {
     if (-not [string]::IsNullOrWhiteSpace($env:OPENCLAW_GIT_DIR)) {
         return $env:OPENCLAW_GIT_DIR
@@ -2483,6 +2501,7 @@ function Main {
             Fail-Install
             return
         }
+        Set-OpenClawLocalGatewayDefaults
         Refresh-GatewayServiceIfLoaded
 
         if ($isUpgrade) {
@@ -2622,6 +2641,7 @@ function Main {
         return
     }
 
+    Set-OpenClawLocalGatewayDefaults
     Refresh-GatewayServiceIfLoaded
 
     # Step 3: Run doctor for migrations if upgrading or git install

@@ -94,6 +94,12 @@ try {
       { path: "gateway.mode", value: "local" },
       { path: "gateway.bind", value: process.env.OPENCLAW_GATEWAY_BIND ?? "lan" },
     ];
+    // The Control UI shows a token/setup gate when the gateway demands a secret.
+    // A hosted image must keep auth (the gateway refuses a lan bind without it),
+    // so default to token auth; a trusted single-tenant loopback setup can opt
+    // out with OPENCLAW_GATEWAY_AUTH_MODE=none.
+    const authMode = process.env.OPENCLAW_GATEWAY_AUTH_MODE ?? "token";
+    configPaths.push({ path: "gateway.auth.mode", value: authMode });
     // A hosting platform terminates TLS and forwards the request. The gateway
     // rejects forwarded traffic unless the proxy hop is trusted, so operators
     // declare it here (comma-separated CIDRs) instead of editing config by hand.
