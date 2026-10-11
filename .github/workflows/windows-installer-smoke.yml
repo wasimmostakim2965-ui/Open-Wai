@@ -10,7 +10,9 @@ name: Windows installer smoke test
 #   2. the bundled runtime's node + CLI work offline (openclaw --version)
 #   3. the installed OpenClaw.exe launches, stays alive, and is not a crash
 #   4. the local Gateway answers HTTP (/healthz) so the UI can connect
-#   5. a screenshot of the running app is uploaded as evidence
+#   5. the desktop dashboard returns a one-time bootstrap URL, so the app opens
+#      chat directly instead of stopping on the token/setup gate
+#   6. a screenshot of the running app is uploaded as evidence
 on:
   workflow_dispatch:
     inputs:
