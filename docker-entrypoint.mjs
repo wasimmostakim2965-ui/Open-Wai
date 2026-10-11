@@ -86,6 +86,30 @@ try {
         child?.kill(signal === "SIGHUP" || signal === "SIGQUIT" ? "SIGTERM" : signal);
       });
     }
+    // Hosted runtimes (Railway et al.) start this image directly instead of
+    // scripts/docker/setup.sh, so nothing pins the local gateway mode. Without
+    // it the gateway refuses to start ("existing config is missing gateway.mode").
+    // Pin it here, mirroring setup.sh, before doctor and the gateway read config.
+    const configBatch = JSON.stringify([
+      { path: "gateway.mode", value: "local" },
+      { path: "gateway.bind", value: process.env.OPENCLAW_GATEWAY_BIND ?? "lan" },
+    ]);
+    await new Promise((resolve) => {
+      const configChild = spawn(
+        process.execPath,
+        [
+          path.join(root, "openclaw.mjs"),
+          ...invocation.rootOptions,
+          "config",
+          "set",
+          "--batch-json",
+          configBatch,
+        ],
+        { stdio: "inherit", env: process.env },
+      );
+      configChild.once("close", resolve);
+      configChild.once("error", resolve);
+    });
     child = spawn(
       process.execPath,
       [
