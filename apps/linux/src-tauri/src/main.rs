@@ -185,7 +185,7 @@ struct BuildInfo {
 fn has_bundled_runtime(app: &AppHandle) -> bool {
     let candidates = [
         tauri::path::BaseDirectory::Resource,
-        tauri::path::BaseDirectory::App,
+        tauri::path::BaseDirectory::AppData,
         tauri::path::BaseDirectory::AppLocalData,
     ];
     candidates.into_iter().any(|base| {
