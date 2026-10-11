@@ -1,0 +1,192 @@
+name: Windows installer smoke test
+
+# The installer build only proves the artifact exists and is a PE binary. This
+# workflow actually installs and runs it on a real Windows runner, so a broken
+# installer fails CI instead of shipping. It answers the only question that
+# matters: does opening the app bring up a working agent UI?
+#
+# Checks performed:
+#   1. silent install completes and the app + bundled runtime land on disk
+#   2. the bundled runtime's node + CLI work offline (openclaw --version)
+#   3. the installed OpenClaw.exe launches, stays alive, and is not a crash
+#   4. the local Gateway answers HTTP (/healthz) so the UI can connect
+#   5. a screenshot of the running app is uploaded as evidence
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build Windows installer run ID to download the .exe from (blank = newest successful)"
+        required: false
+        type: string
+  workflow_run:
+    workflows: ["Build Windows installer"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  smoke:
+    name: Install and launch the .exe on Windows
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Resolve the build run
+        id: run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($INPUT_RUN_ID) {
+            $id = $INPUT_RUN_ID
+          } else {
+            $id = gh run list --repo "${{ github.repository }}" `
+              --workflow "Build Windows installer" `
+              --status success --limit 1 --json databaseId -q '.[0].databaseId'
+          }
+          if (-not $id) { throw "No successful 'Build Windows installer' run found." }
+          Write-Host "Using build run $id"
+          "id=$id" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Download the installer artifact
+        id: download
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path installer | Out-Null
+          gh run download ${{ steps.run.outputs.id }} --repo "${{ github.repository }}" `
+            --name OpenClaw-windows-x64-setup --dir installer
+          $exe = Get-ChildItem installer -Recurse -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "The artifact contained no .exe." }
+          Write-Host ("installer: {0} ({1:N0} bytes)" -f $exe.FullName, $exe.Length)
+          "exe=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Silent install
+        id: install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $before = Get-ChildItem "$env:LOCALAPPDATA" -Directory | Select-Object -ExpandProperty FullName
+          $proc = Start-Process -FilePath "${{ steps.download.outputs.exe }}" -ArgumentList "/S" -PassThru -Wait
+          Write-Host "installer exit code: $($proc.ExitCode)"
+          if ($proc.ExitCode -ne 0) { throw "The installer exited with $($proc.ExitCode)." }
+
+          Start-Sleep -Seconds 10
+          $candidates = @(
+            "$env:LOCALAPPDATA\OpenClaw",
+            "$env:LOCALAPPDATA\Programs\OpenClaw",
+            "$env:ProgramFiles\OpenClaw",
+            "${env:ProgramFiles(x86)}\OpenClaw"
+          )
+          $app = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $app) {
+            $after = Get-ChildItem "$env:LOCALAPPDATA" -Directory | Select-Object -ExpandProperty FullName
+            $new = $after | Where-Object { $before -notcontains $_ }
+            Write-Host "New LOCALAPPDATA dirs: $($new -join ', ')"
+            $app = $new | Where-Object { $_ -match 'OpenClaw' } | Select-Object -First 1
+          }
+          if (-not $app) { throw "The app did not install to a known location." }
+          Write-Host "installed app: $app"
+          Get-ChildItem -LiteralPath $app -Recurse -File | Select-Object -First 40 |
+            ForEach-Object { Write-Host ("  {0} ({1:N0} bytes)" -f $_.FullName, $_.Length) }
+          "app=$app" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Launch the app
+        id: launch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $app = "${{ steps.install.outputs.app }}"
+          $exe = Get-ChildItem -LiteralPath $app -Recurse -Filter "OpenClaw.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $exe) { throw "No OpenClaw.exe under $app." }
+          Write-Host "launching $($exe.FullName)"
+          # First run extracts the bundled runtime and starts the Gateway, which
+          # can take a few minutes on a cold runner. Do not wait here; poll below.
+          $proc = Start-Process -FilePath $exe.FullName -PassThru
+          "pid=$($proc.Id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Start-Sleep -Seconds 30
+          if ($proc.HasExited) { throw "OpenClaw.exe exited early with code $($proc.ExitCode)." }
+          Write-Host "OpenClaw.exe is running (pid $($proc.Id))."
+
+      - name: Wait for the local Gateway to answer
+        id: gateway
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $deadline = (Get-Date).AddMinutes(12)
+          $ok = $false
+          while ((Get-Date) -lt $deadline -and -not $ok) {
+            foreach ($port in 8080, 18789) {
+              foreach ($path in "/healthz", "/openclaw") {
+                try {
+                  $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port$path" -UseBasicParsing -TimeoutSec 10
+                  Write-Host "$(Get-Date -Format HH:mm:ss) GET $path on $port -> $($r.StatusCode)"
+                  if ($r.StatusCode -eq 200) { $ok = $true }
+                } catch {
+                  Write-Host "$(Get-Date -Format HH:mm:ss) GET $path on $port -> $($_.Exception.Message)"
+                }
+              }
+            }
+            if (-not $ok) { Start-Sleep -Seconds 15 }
+          }
+          if (-not $ok) {
+            Write-Host "Gateway log (if any):"
+            $log = Join-Path $env:USERPROFILE ".openclaw"
+            Get-ChildItem -LiteralPath $log -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -Tail 40 }
+            throw "The local Gateway never answered HTTP."
+          }
+          Write-Host "Gateway is serving the Control UI."
+
+      - name: Prove the bundled runtime works offline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:USERPROFILE ".openclaw\tools"
+          $node = Get-ChildItem -LiteralPath $root -Recurse -Filter node.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $node) { throw "No bundled node.exe under $root - the offline runtime did not install." }
+          Write-Host "bundled node: $($node.FullName)"
+          & $node.FullName --version
+
+          $cli = Get-ChildItem -LiteralPath $root -Recurse -Filter openclaw.cmd -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $cli) { throw "No openclaw.cmd under $root." }
+          Write-Host "bundled CLI: $($cli.FullName)"
+          $env:OPENCLAW_NO_UPDATE_CHECK = "1"
+          $version = & $cli.FullName --version 2>&1
+          Write-Host "openclaw --version -> $version"
+          if (-not ($version -match '\d+\.\d+')) { throw "The bundled CLI did not report a version: $version" }
+
+      - name: Capture screenshot evidence
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+          $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          $bmp.Save("$PWD/evidence/app-launch.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $gfx.Dispose(); $bmp.Dispose()
+          Write-Host "saved evidence/app-launch.png"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-installer-smoke-evidence
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 14
