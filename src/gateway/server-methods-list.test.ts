@@ -74,6 +74,10 @@ describe("GATEWAY_EVENTS", () => {
 
 describe("listGatewayMethods", () => {
   const expectedMethodsAfterModelProbe = [
+    "models.hub.search",
+    "models.hub.files",
+    "models.hub.specs",
+    "models.hub.download",
     "migrations.memory.plan",
     "migrations.memory.apply",
     "ui.command",

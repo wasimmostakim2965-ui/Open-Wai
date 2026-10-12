@@ -76,6 +76,7 @@ const APP_ROUTE_DEFINITIONS = {
   "ai-agents": { path: "/settings/ai-agents", aliases: ["/ai-agents"] },
   "model-setup": { path: "/settings/model-setup", aliases: ["/model-setup"] },
   "model-providers": { path: "/settings/model-providers", aliases: ["/model-providers"] },
+  "model-hub": { path: "/settings/model-hub", aliases: ["/model-hub"] },
   // Memory import, sessions, and worktrees are workspace destinations; the
   // /settings/* aliases keep pre-restructure bookmarks and deep links working.
   "memory-import": { path: "/memory-import", aliases: ["/settings/memory-import"] },

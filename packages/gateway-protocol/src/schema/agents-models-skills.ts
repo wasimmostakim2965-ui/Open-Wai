@@ -249,6 +249,98 @@ export const ModelsProbeResultSchema = closedObject({
   results: Type.Array(ModelsProbeTargetResultSchema),
 });
 
+// Hugging Face GGUF model hub browser: search, file listing, spec reading, and
+// download into the local model cache (RPC methods `models.hub.*`).
+/** Sorts accepted by the Hugging Face `/api/models` listing. */
+export const ModelHubSortSchema = Type.Union([
+  Type.Literal("downloads"),
+  Type.Literal("likes"),
+  Type.Literal("lastModified"),
+  Type.Literal("createdAt"),
+]);
+
+/** Searches the Hugging Face hub for GGUF repositories. */
+export const ModelsHubSearchParamsSchema = closedObject({
+  query: Type.Optional(Type.String({ maxLength: 256 })),
+  author: Type.Optional(Type.String({ maxLength: 256 })),
+  sort: Type.Optional(ModelHubSortSchema),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+});
+
+/** One hub repository summary row. */
+export const ModelsHubRepoSummarySchema = closedObject({
+  id: NonEmptyString,
+  author: Type.Optional(Type.String()),
+  downloads: Type.Optional(Type.Integer({ minimum: 0 })),
+  likes: Type.Optional(Type.Integer({ minimum: 0 })),
+  lastModified: Type.Optional(Type.String()),
+  gated: Type.Optional(Type.Boolean()),
+  pipelineTag: Type.Optional(Type.String()),
+});
+
+export const ModelsHubSearchResultSchema = closedObject({
+  repos: Type.Array(ModelsHubRepoSummarySchema),
+  /** True when the hub returned more rows than the requested limit. */
+  hasMore: Type.Boolean(),
+});
+
+/** Lists the GGUF files (and their byte sizes) inside one hub repository. */
+export const ModelsHubFilesParamsSchema = closedObject({
+  repo: NonEmptyString,
+  revision: Type.Optional(Type.String({ maxLength: 256 })),
+});
+
+export const ModelsHubFileSchema = closedObject({
+  path: NonEmptyString,
+  size: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
+export const ModelsHubFilesResultSchema = closedObject({
+  repo: NonEmptyString,
+  revision: NonEmptyString,
+  files: Type.Array(ModelsHubFileSchema),
+});
+
+/** Reads hub GGUF metadata (architecture, context length, parameter count). */
+export const ModelsHubSpecsParamsSchema = closedObject({
+  repo: NonEmptyString,
+  revision: Type.Optional(Type.String({ maxLength: 256 })),
+});
+
+export const ModelsHubSpecsResultSchema = closedObject({
+  repo: NonEmptyString,
+  architecture: Type.Optional(Type.String()),
+  contextLength: Type.Optional(Type.Integer({ minimum: 0 })),
+  parameterCount: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Quantisation file names advertised by the repository. */
+  quantizations: Type.Array(Type.String()),
+});
+
+/** Downloads one GGUF file from a hub repository into the local model cache. */
+export const ModelsHubDownloadParamsSchema = closedObject({
+  repo: NonEmptyString,
+  // Confine the download to a plain, relative .gguf path: no `.` segments, no
+  // backslashes, and a real GGUF extension (case-insensitive).
+  file: Type.String({
+    minLength: 1,
+    maxLength: 1024,
+    pattern: /^(?:(?!\.\.)[^\\])+\.[gG][gG][uU][fF]$/,
+  }),
+  revision: Type.Optional(Type.String({ maxLength: 256 })),
+});
+
+export const ModelsHubDownloadResultSchema = closedObject({
+  repo: NonEmptyString,
+  revision: NonEmptyString,
+  file: NonEmptyString,
+  /** Absolute path of the downloaded and checksum-verified GGUF file. */
+  path: NonEmptyString,
+  sizeBytes: Type.Integer({ minimum: 0 }),
+  sha256: NonEmptyString,
+  /** True when an identical file was already present and the download was skipped. */
+  reused: Type.Boolean(),
+});
+
 /** Reads installed skill status, optionally for a selected agent. */
 export const SkillsStatusParamsSchema = closedObject({
   agentId: Type.Optional(NonEmptyString),
@@ -1092,6 +1184,17 @@ export type AuthProbeStatus = Static<typeof AuthProbeStatusSchema>;
 export type ModelsProbeParams = Static<typeof ModelsProbeParamsSchema>;
 export type ModelsProbeTargetResult = Static<typeof ModelsProbeTargetResultSchema>;
 export type ModelsProbeResult = Static<typeof ModelsProbeResultSchema>;
+export type ModelHubSort = Static<typeof ModelHubSortSchema>;
+export type ModelsHubSearchParams = Static<typeof ModelsHubSearchParamsSchema>;
+export type ModelsHubRepoSummary = Static<typeof ModelsHubRepoSummarySchema>;
+export type ModelsHubSearchResult = Static<typeof ModelsHubSearchResultSchema>;
+export type ModelsHubFilesParams = Static<typeof ModelsHubFilesParamsSchema>;
+export type ModelsHubFile = Static<typeof ModelsHubFileSchema>;
+export type ModelsHubFilesResult = Static<typeof ModelsHubFilesResultSchema>;
+export type ModelsHubSpecsParams = Static<typeof ModelsHubSpecsParamsSchema>;
+export type ModelsHubSpecsResult = Static<typeof ModelsHubSpecsResultSchema>;
+export type ModelsHubDownloadParams = Static<typeof ModelsHubDownloadParamsSchema>;
+export type ModelsHubDownloadResult = Static<typeof ModelsHubDownloadResultSchema>;
 export type SkillsStatusParams = Static<typeof SkillsStatusParamsSchema>;
 export type GitHubIdentityFacts = Static<typeof GitHubIdentityFactsSchema>;
 export type GitHubSelectedIdentity = Static<typeof GitHubSelectedIdentitySchema>;

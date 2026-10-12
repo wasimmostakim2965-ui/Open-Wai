@@ -307,6 +307,7 @@ const SETTINGS_SUBPAGE_ROUTES: readonly NavigationRouteId[] = [
   "config",
   "ai-agents",
   "model-setup",
+  "model-hub",
   "lobsterdex",
 ];
 export const SETTINGS_SEARCHABLE_SUBPAGE_ROUTES: readonly NavigationRouteId[] = ["ai-agents"];
@@ -315,6 +316,7 @@ const SETTINGS_SUBPAGE_OWNER_ROUTES: Partial<
 > = {
   "ai-agents": "agents",
   "model-setup": "model-providers",
+  "model-hub": "model-providers",
 };
 
 const SETTINGS_NAVIGATION_ROUTES: ReadonlySet<NavigationRouteId> = new Set([
@@ -374,6 +376,7 @@ const NAVIGATION_PRESENTATION: Record<NavigationRouteId, NavigationPresentation>
   "ai-agents": navigationPresentation("brain", "aiAgents"),
   "model-setup": navigationPresentation("spark", "modelSetup"),
   "model-providers": ["box", "routeTitles.modelProviders", "subtitles.modelProviders"],
+  "model-hub": ["layers", "routeTitles.modelHub", "subtitles.modelHub"],
   "memory-import": navigationPresentation("download", "memoryImport"),
   notifications: ["bell", "routeTitles.notifications", "subtitles.notifications"],
   security: navigationPresentation("shieldCheck", "security"),

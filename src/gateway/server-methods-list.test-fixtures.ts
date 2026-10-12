@@ -69,6 +69,7 @@ gateway.suspend.status gateway.suspend.resume chat.toolTitles sessions.diff
 openclaw.setup.verify environments.create environments.destroy sessions.catalog.list
 sessions.catalog.read terminal.upload sessions.catalog.continue sessions.catalog.archive
 approval.get approval.resolve sessions.search sessions.dispatch sessions.reclaim models.probe
+models.hub.search models.hub.files models.hub.specs models.hub.download
 migrations.memory.plan migrations.memory.apply ui.command approval.history
 plugin.surface.refresh conversations.list session.discussion.info session.discussion.open
 board.prompt.authorize board.data.read board.action sessions.observer.visibility

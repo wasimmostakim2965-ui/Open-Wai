@@ -429,6 +429,10 @@ export const CORE_GATEWAY_METHOD_SPECS = [
     SIDECAR_CONTROL_PLANE_WRITE,
   ],
   ["models.probe", "models-probe", "operator.admin", "<=2026.7"],
+  ["models.hub.search", "models-hub", "operator.read", "2026.9"],
+  ["models.hub.files", "models-hub", "operator.read", "2026.9"],
+  ["models.hub.specs", "models-hub", "operator.read", "2026.9"],
+  ["models.hub.download", "models-hub", "operator.admin", "2026.9", CONTROL_PLANE_WRITE],
   // Memory migration reads host assistant state and writes agent workspaces.
   ["migrations.memory.plan", "migrations", "operator.admin", "2026.7"],
   ["migrations.memory.apply", "migrations", "operator.admin", "2026.7", CONTROL_PLANE_WRITE],

@@ -30,6 +30,7 @@ export const CONTROL_UI_RESERVED_ROUTE_SEGMENTS: readonly string[] = Object.free
   "mcp",
   "meetings",
   "memory-import",
+  "model-hub",
   "model-providers",
   "model-setup",
   "new",

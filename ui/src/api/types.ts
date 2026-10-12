@@ -8,6 +8,12 @@ import type {
   ErrorShape,
   SessionsFilesListResult as ProtocolSessionsFilesListResult,
 } from "../../../packages/gateway-protocol/src/index.js";
+export type {
+  ModelsHubFile,
+  ModelsHubDownloadResult,
+  ModelsHubRepoSummary,
+  ModelsHubSpecsResult,
+} from "../../../packages/gateway-protocol/src/index.js";
 import type { ChannelsStatusResult } from "../../../packages/gateway-protocol/src/schema/channels.js";
 import type {
   SessionEntryArchiveReason,

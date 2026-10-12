@@ -1,0 +1,154 @@
+.model-hub {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.model-hub__search {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--oc-border, rgba(127, 127, 127, 0.3));
+  border-radius: 8px;
+  background: var(--oc-input-background, transparent);
+  color: inherit;
+  font: inherit;
+}
+
+.model-hub__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.model-hub__repo {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.model-hub__repo:hover,
+.model-hub__repo--selected {
+  background: var(--oc-hover-background, rgba(127, 127, 127, 0.12));
+}
+
+.model-hub__repo-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-hub__repo-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  opacity: 0.75;
+  font-size: 0.85em;
+}
+
+.model-hub__repo-meta svg {
+  width: 14px;
+  height: 14px;
+  vertical-align: -2px;
+}
+
+.model-hub__badge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.2);
+}
+
+.model-hub__file {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+}
+
+.model-hub__file-path {
+  overflow-wrap: anywhere;
+}
+
+.model-hub__file-size {
+  flex-shrink: 0;
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+}
+
+.model-hub__specs {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0 0 12px;
+}
+
+.model-hub__specs dt {
+  opacity: 0.75;
+}
+
+.model-hub__specs dd {
+  margin: 0;
+}
+
+.model-hub__hint,
+.model-hub__error {
+  margin: 0;
+  padding: 8px 12px;
+}
+
+.model-hub__error {
+  color: var(--oc-danger-text, #d93025);
+}
+
+.model-hub__download {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid var(--oc-border, rgba(127, 127, 127, 0.3));
+  border-radius: 8px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.model-hub__download:hover:not(:disabled) {
+  background: var(--oc-hover-background, rgba(127, 127, 127, 0.12));
+}
+
+.model-hub__download:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.model-hub__download svg {
+  width: 14px;
+  height: 14px;
+}
+
+.model-hub__download-status {
+  flex-basis: 100%;
+  padding: 4px 0 0;
+  font-size: 0.85em;
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+}
+
+.model-hub__file {
+  flex-wrap: wrap;
+}
