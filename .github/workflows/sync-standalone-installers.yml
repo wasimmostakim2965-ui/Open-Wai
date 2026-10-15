@@ -1,0 +1,64 @@
+name: Sync Standalone Installers
+
+# The Windows Hub and the docs fetch install-cli.sh as a single standalone file
+# (e.g. `curl .../install-cli.sh | bash -s -- ...`). A piped script has no
+# BASH_SOURCE, so it cannot `source ./install-policy.sh`; it must ship the policy
+# inlined. `scripts/build-installers.mjs` performs that inlining. This workflow
+# regenerates the committed standalone copies in `installers/` whenever the
+# sources change, then commits them back so the raw URL the Hub points at never
+# drifts from `scripts/`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/install.sh
+      - scripts/install-cli.sh
+      - scripts/install-policy.sh
+      - scripts/build-installers.mjs
+      - scripts/lib/standalone-installers.mjs
+      - .github/workflows/sync-standalone-installers.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-standalone-installers-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Assemble standalone installers
+        run: node scripts/build-installers.mjs dist/installers
+
+      - name: Verify both installers parse and run from stdin
+        run: |
+          set -euo pipefail
+          for installer in install.sh install-cli.sh; do
+            bash -n "dist/installers/$installer"
+            bash -s -- --help < "dist/installers/$installer" >/dev/null
+          done
+
+      - name: Commit refreshed installers
+        run: |
+          set -euo pipefail
+          mkdir -p installers
+          cp dist/installers/install.sh dist/installers/install-cli.sh installers/
+          if git diff --quiet -- installers; then
+            echo "Standalone installers already up to date."
+            exit 0
+          fi
+          git config user.name "openhands"
+          git config user.email "openhands@all-hands.dev"
+          git add -f installers/install.sh installers/install-cli.sh
+          git commit -m "chore: sync standalone installers from scripts/"
+          git push
