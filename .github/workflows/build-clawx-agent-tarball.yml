@@ -1,0 +1,86 @@
+name: Build ClawX agent tarball
+
+# Builds the Open-Wai agent runtime and publishes a ready-to-install tarball
+# (dist/ included) that the Open-Wai-Desktop app depends on. This is what makes
+# the desktop app pull its agent core from OUR repository instead of npm/openclaw.
+#
+# It also checks that Open-Wai-Desktop's pinned patch still applies to the freshly
+# built dist. The patch edits minified dist files by hashed filename, so a build
+# that drifts from the expected chunk names would break the desktop build; this
+# check reports that here instead of 40 minutes later in the app's CI.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [clawx-agent]
+    paths:
+      - "package.json"
+      - ".github/workflows/build-clawx-agent-tarball.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  tarball:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      NODE_VERSION: "24.21.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Verify required build outputs
+        run: |
+          test -f openclaw.mjs
+          test -f dist/entry.js -o -f dist/index.js
+
+      - name: Check desktop patch still applies
+        continue-on-error: true
+        run: |
+          curl -fsSL -o /tmp/desktop.patch \
+            "https://raw.githubusercontent.com/wasimmostakim2965-ui/Open-Wai-Desktop/main/patches/openclaw@2026.7.1-2.patch"
+          rm -rf /tmp/distcheck && mkdir -p /tmp/distcheck && cd /tmp/distcheck
+          cp -r "$GITHUB_WORKSPACE/dist" dist
+          git init -q .
+          git add -A
+          git -c user.email=ci@local -c user.name=ci commit -qm base
+          if git apply --check /tmp/desktop.patch; then
+            echo "PATCH_APPLIES=yes" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "PATCH_APPLIES=no" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Pack tarball
+        run: pnpm pack
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-clawx-agent-tarball
+          path: openclaw-*.tgz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view clawx-agent >/dev/null 2>&1 || \
+            gh release create clawx-agent --title "ClawX agent tarball" \
+              --notes "Ready-to-install Open-Wai agent runtime for Open-Wai-Desktop."
+          gh release upload clawx-agent openclaw-*.tgz --clobber
