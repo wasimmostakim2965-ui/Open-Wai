@@ -281,19 +281,12 @@ should_prefer_offline_pnpm_install() {
 }
 
 resolve_git_openclaw_ref() {
-    local requested="${OPENCLAW_VERSION:-latest}"
-    local resolved_version=""
+    local requested="${OPENCLAW_VERSION:-main}"
 
     case "$requested" in
         ""|latest|next|beta)
-            resolved_version="$(installer_npm view "openclaw" "dist-tags.${requested:-latest}" 2>/dev/null || true)"
-            if [[ -n "$resolved_version" ]]; then
-                echo "v${resolved_version}"
-            elif [[ -z "$requested" || "$requested" == "latest" ]]; then
-                echo "main"
-            else
-                echo "$requested"
-            fi
+            # Build from our fork's main branch; do not depend on upstream npm dist-tags.
+            echo "main"
             return 0
             ;;
         [0-9]*.[0-9]*.[0-9]*)
