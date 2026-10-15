@@ -92,7 +92,7 @@ function placeholderPackageJson(packageName) {
     license: "MIT",
     repository: {
       type: "git",
-      url: "git+https://github.com/openclaw/openclaw.git",
+      url: "git+https://github.com/wasimmostakim2965-ui/Open-Wai.git",
     },
     publishConfig: {
       access: "public",

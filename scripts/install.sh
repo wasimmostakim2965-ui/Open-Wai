@@ -2114,7 +2114,7 @@ install_node_with_user_prefix() {
 
     ui_info "Using a user-space Node.js runtime because the system Node.js links unsafe SQLite"
     run_required_step "Downloading user-space Node.js installer" \
-        download_validated_script "https://openclaw.ai/install-cli.sh" "$cli_installer"
+        download_validated_script "https://raw.githubusercontent.com/wasimmostakim2965-ui/Open-Wai/main/scripts/install-cli.sh" "$cli_installer"
     # The child Bash expands this script's positional arguments, not this shell.
     # shellcheck disable=SC2016
     run_required_step "Installing user-space Node.js" \
