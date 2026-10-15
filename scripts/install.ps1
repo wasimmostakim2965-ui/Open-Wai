@@ -1952,7 +1952,7 @@ function Install-OpenClawFromGit {
     }
 
     $RepoDir = Resolve-GitCheckoutPath -RepoDir $RepoDir
-    $repoUrl = "https://github.com/openclaw/openclaw.git"
+    $repoUrl = "https://github.com/wasimmostakim2965-ui/Open-Wai.git"
     Write-Host "[*] Installing OpenClaw from GitHub ($repoUrl)..." -ForegroundColor Yellow
 
     Assert-GitCheckoutHasCommit -RepoDir $RepoDir

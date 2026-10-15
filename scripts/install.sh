@@ -2856,7 +2856,7 @@ publish_executable_wrapper() {
 
 install_openclaw_from_git() {
     local repo_dir="$1"
-    local repo_url="https://github.com/openclaw/openclaw.git"
+    local repo_url="https://github.com/wasimmostakim2965-ui/Open-Wai.git"
 
     mkdir -p "$(dirname "$repo_dir")"
     if [[ -d "$repo_dir" ]]; then
