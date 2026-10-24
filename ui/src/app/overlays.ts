@@ -1,13 +1,10 @@
-import type { SessionApprovalEvent } from "../../../packages/gateway-protocol/src/index.js";
 import {
   GATEWAY_EVENT_UPDATE_AVAILABLE,
   GATEWAY_EVENT_UPDATE_RUN_CHANGED,
   type GatewayUpdateAvailableEventPayload,
 } from "../../../src/gateway/events.js";
 import { registerListener } from "../../../src/shared/listeners.js";
-import type { GatewayBrowserClient } from "../api/gateway.ts";
 import { t } from "../i18n/index.ts";
-import type { DevicePairSetupAccess } from "../lib/device-pair-setup.ts";
 import { formatUiError } from "../lib/format-error.ts";
 import { showToast } from "../lib/toast.ts";
 import {
@@ -18,9 +15,7 @@ import {
   parseApprovalRequestedEvent,
   parseApprovalResolvedEvent,
   resolveApprovalRequest,
-  type ExecApprovalDecision,
   type ExecApprovalPromptState,
-  type ExecApprovalRequest,
 } from "./exec-approval.ts";
 import { gatewayPresentationScope } from "./gateway-presentation-scope.ts";
 import type { ApplicationGateway } from "./gateway.ts";
@@ -29,7 +24,7 @@ import {
   createOverlayApprovalRefresher,
   readOverlayOperatorAccessTransition,
 } from "./overlays-access.ts";
-import type { ApplicationOverlaySnapshot } from "./overlays-types.ts";
+import type { ApplicationOverlays, ApplicationOverlaySnapshot } from "./overlays-types.ts";
 import {
   createApplicationUpdateOverlays,
   type ApplicationUpdateOverlayHooks,
@@ -38,7 +33,7 @@ import {
 export function createApplicationOverlays(
   gateway: ApplicationGateway,
   hooks: ApplicationUpdateOverlayHooks = {},
-) {
+): ApplicationOverlays {
   const updates = createApplicationUpdateOverlays(gateway, publish, hooks);
   const runConnectionBootstrap = (key: string, task: () => Promise<unknown>) =>
     hooks.connectionBootstrap?.run(key, task) ?? task();
@@ -258,8 +253,7 @@ export function createApplicationOverlays(
     get snapshot() {
       return snapshot;
     },
-    subscribe: (listener: (snapshot: ApplicationOverlaySnapshot) => void) =>
-      registerListener(listeners, listener),
+    subscribe: (listener) => registerListener(listeners, listener),
     refreshUpdateStatus: updates.refreshUpdateStatus,
     acknowledgeUpdateRun: updates.acknowledgeUpdateRun,
     captureUpdateTarget: updates.captureUpdateTarget,
@@ -267,11 +261,7 @@ export function createApplicationOverlays(
     holdUpdate: updates.holdUpdate,
     diagnoseUpdateFailure: updates.diagnoseUpdateFailure,
     reportUpdateFailure: updates.reportUpdateFailure,
-    reconcileApprovalTerminals(
-      this: void,
-      client: GatewayBrowserClient,
-      events: readonly Extract<SessionApprovalEvent, { phase: "terminal" }>[],
-    ) {
+    reconcileApprovalTerminals(client, events) {
       if (
         !isCurrentClient(client) ||
         !readGatewayOperatorAccess(gateway.snapshot).canReviewApprovals
@@ -286,12 +276,7 @@ export function createApplicationOverlays(
         publish();
       }
     },
-    async decideApproval(
-      this: void,
-      decision: ExecApprovalDecision,
-      approvalId?: string,
-      projectedApproval?: ExecApprovalRequest,
-    ) {
+    async decideApproval(decision, approvalId, projectedApproval) {
       const active = approvalId
         ? (promptState.execApprovalQueue.find((entry) => entry.id === approvalId) ??
           (projectedApproval?.id === approvalId ? projectedApproval : undefined))
@@ -365,7 +350,7 @@ export function createApplicationOverlays(
         }
       }
     },
-    async openDevicePairSetup(this: void) {
+    async openDevicePairSetup() {
       const client = gateway.snapshot.client;
       const epoch = connectedEpoch;
       const canOpen = () =>
@@ -404,13 +389,13 @@ export function createApplicationOverlays(
       await publishDevicePairSetupOperation(setupOperation);
       return pairing.state.devicePairSetupOpen;
     },
-    async refreshDevicePairSetup(this: void) {
+    async refreshDevicePairSetup() {
       if (!pairing || disposed || !readGatewayOperatorAccess(gateway.snapshot).canAdmin) {
         return;
       }
       await publishDevicePairSetupOperation(pairing.runtime.refreshDevicePairSetup(pairing.state));
     },
-    async setDevicePairSetupAccess(this: void, access: DevicePairSetupAccess) {
+    async setDevicePairSetupAccess(access) {
       if (!pairing || disposed || !readGatewayOperatorAccess(gateway.snapshot).canAdmin) {
         return;
       }
@@ -418,11 +403,11 @@ export function createApplicationOverlays(
         pairing.runtime.setDevicePairSetupAccess(pairing.state, access),
       );
     },
-    closeDevicePairSetup(this: void) {
+    closeDevicePairSetup() {
       pairing?.close();
       publish();
     },
-    dispose(this: void) {
+    dispose() {
       disposed = true;
       approvalDecision = null;
       refreshApprovals.cancel();
