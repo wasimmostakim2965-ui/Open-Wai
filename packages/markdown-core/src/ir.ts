@@ -718,49 +718,6 @@ function renderInlineCode(state: RenderState, content: string) {
   target.styles.push({ start, end: start + content.length, style: "code" });
 }
 
-function renderCodeBlock(
-  state: RenderState,
-  content: string,
-  info: string | undefined,
-  sourceNewlineCount: number | undefined,
-  origin: "fenced" | "indented",
-  sourceMap?: [number, number] | null,
-  codeClosed?: boolean,
-) {
-  let code = content;
-  if (!code.endsWith("\n")) {
-    code = `${code}\n`;
-  }
-  const target = resolveRenderTarget(state);
-  const start = target.text.length;
-  const language = info?.trim().split(/\s+/, 1)[0] || undefined;
-  target.text += code;
-  target.styles.push(
-    createStyleSpan({
-      start,
-      end: start + code.length,
-      style: "code_block",
-      language,
-    }),
-  );
-  state.blocks.push({
-    kind: "code_block",
-    start,
-    end: start + code.length,
-    depth: state.env.listStack.length + state.blockquoteStack.length + 1,
-    blockquoteDepth: state.blockquoteStack.length,
-    codeOrigin: origin,
-    ...(codeClosed !== undefined ? { codeClosed } : {}),
-    ...(language ? { language } : {}),
-    ...(sourceMap ? { sourceStartLine: sourceMap[0], sourceEndLine: sourceMap[1] } : {}),
-  });
-  if (state.env.listStack.length === 0) {
-    const extraNewlines =
-      sourceNewlineCount === undefined ? 1 : Math.max(0, sourceNewlineCount - 1);
-    target.text += "\n".repeat(extraNewlines);
-  }
-}
-
 function isFenceClosed(token: MarkdownToken): boolean {
   const sourceLines = (token.map?.[1] ?? 0) - (token.map?.[0] ?? 0);
   const content = token.content ?? "";
@@ -1104,21 +1061,49 @@ function renderTokens(tokens: MarkdownToken[], state: RenderState): void {
         break;
       }
       case "code_block":
-      case "fence":
-        renderCodeBlock(
-          state,
-          token.content ?? "",
-          token.info,
-          sourceBlockNewlineCount(
-            state.preserveSourceBlockSpacing,
-            nextMappedBlockStarts[tokenIndex],
-            token.map?.[1],
-          ),
-          token.type === "fence" ? "fenced" : "indented",
-          token.map,
-          token.type === "fence" ? isFenceClosed(token) : undefined,
+      case "fence": {
+        let code = token.content ?? "";
+        const info = token.info;
+        const sourceNewlineCount = sourceBlockNewlineCount(
+          state.preserveSourceBlockSpacing,
+          nextMappedBlockStarts[tokenIndex],
+          token.map?.[1],
         );
+        const sourceMap = token.map;
+        const codeClosed = token.type === "fence" ? isFenceClosed(token) : undefined;
+        if (!code.endsWith("\n")) {
+          code = `${code}\n`;
+        }
+        const target = resolveRenderTarget(state);
+        const start = target.text.length;
+        const language = info?.trim().split(/\s+/, 1)[0] || undefined;
+        target.text += code;
+        target.styles.push(
+          createStyleSpan({
+            start,
+            end: start + code.length,
+            style: "code_block",
+            language,
+          }),
+        );
+        state.blocks.push({
+          kind: "code_block",
+          start,
+          end: start + code.length,
+          depth: state.env.listStack.length + state.blockquoteStack.length + 1,
+          blockquoteDepth: state.blockquoteStack.length,
+          codeOrigin: token.type === "fence" ? "fenced" : "indented",
+          ...(codeClosed !== undefined ? { codeClosed } : {}),
+          ...(language ? { language } : {}),
+          ...(sourceMap ? { sourceStartLine: sourceMap[0], sourceEndLine: sourceMap[1] } : {}),
+        });
+        if (state.env.listStack.length === 0) {
+          const extraNewlines =
+            sourceNewlineCount === undefined ? 1 : Math.max(0, sourceNewlineCount - 1);
+          target.text += "\n".repeat(extraNewlines);
+        }
         break;
+      }
       case "html_block":
       case "html_inline":
       case RAW_HTML_TOKEN_TYPE:

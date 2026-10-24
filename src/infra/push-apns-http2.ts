@@ -60,24 +60,6 @@ function assertApnsAuthority(authority: string): ApnsAuthority {
   return parsed.origin as ApnsAuthority;
 }
 
-function normalizeConnectProxyUrl(proxyUrl: URL): URL {
-  const normalized = new URL(proxyUrl);
-  normalized.pathname = "/";
-  normalized.search = "";
-  normalized.hash = "";
-  try {
-    // Proxyline decodes auth from its socket callback. Validate first so bad
-    // config rejects normally instead of escaping the EventEmitter boundary.
-    decodeURIComponent(normalized.username);
-    decodeURIComponent(normalized.password);
-  } catch (err) {
-    const detail =
-      err instanceof URIError ? "URI malformed" : err instanceof Error ? err.message : String(err);
-    throw new Error(`Proxy CONNECT failed via ${normalized.origin}: ${detail}`, { cause: err });
-  }
-  return normalized;
-}
-
 async function openApnsTlsTunnel(params: {
   proxyUrl: URL;
   proxyTls?: ManagedProxyTlsOptions;
@@ -88,7 +70,20 @@ async function openApnsTlsTunnel(params: {
 }): Promise<tls.TLSSocket> {
   // CONNECT ignores URL paths. Strip path metadata before Proxyline sees it so
   // tokens embedded in a configured proxy URL cannot surface in errors.
-  const proxyUrl = normalizeConnectProxyUrl(params.proxyUrl);
+  const proxyUrl = new URL(params.proxyUrl);
+  proxyUrl.pathname = "/";
+  proxyUrl.search = "";
+  proxyUrl.hash = "";
+  try {
+    // Proxyline decodes auth from its socket callback. Validate first so bad
+    // config rejects normally instead of escaping the EventEmitter boundary.
+    decodeURIComponent(proxyUrl.username);
+    decodeURIComponent(proxyUrl.password);
+  } catch (err) {
+    const detail =
+      err instanceof URIError ? "URI malformed" : err instanceof Error ? err.message : String(err);
+    throw new Error(`Proxy CONNECT failed via ${proxyUrl.origin}: ${detail}`, { cause: err });
+  }
   const deadline = Date.now() + params.timeoutMs;
   const proxySocket = await openProxyConnectTunnel({
     proxyUrl,
