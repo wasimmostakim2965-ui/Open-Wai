@@ -497,7 +497,6 @@ const ownerWatches: readonly UiE2eOwnerWatch[] = [
     ],
   ),
   pageWatch("ui/src/e2e/chat-error-details.e2e.test.ts", ["chat"]),
-  pageWatch("ui/src/e2e/chat-external-pending-input.e2e.test.ts", ["chat", "profile"]),
   pageWatch(
     "ui/src/e2e/chat-file-copy-retirement.e2e.test.ts",
     ["chat"],
