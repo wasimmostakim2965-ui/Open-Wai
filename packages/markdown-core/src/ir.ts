@@ -623,18 +623,6 @@ function appendParagraphSeparator(
   state.text += token?.hidden ? "\n" : "\n\n";
 }
 
-function appendTopLevelListSeparator(state: RenderState) {
-  if (!state.text.endsWith("\n\n")) {
-    state.text += "\n";
-  }
-}
-
-function appendNestedListSeparator(state: RenderState) {
-  if (!state.text.endsWith("\n")) {
-    state.text += "\n";
-  }
-}
-
 function appendListPrefix(
   state: RenderState,
   isTask: boolean,
@@ -805,20 +793,6 @@ function handleLinkClose(state: RenderState) {
   target.links.push(span);
 }
 
-function initTableState(): TableState {
-  return {
-    sourceHeaders: [],
-    sourceRows: [],
-    currentSourceRow: [],
-    headers: [],
-    rows: [],
-    aligns: [],
-    currentRow: [],
-    currentCell: null,
-    inHeader: false,
-  };
-}
-
 function finishTableCell(cell: RenderTarget): MarkdownTableCell {
   closeRemainingStyles(cell);
   return copyHtmlTags(cell, {
@@ -858,36 +832,6 @@ function appendCell(state: RenderState, cell: MarkdownTableCell) {
   );
 }
 
-function collectTableBlock(
-  state: RenderState,
-  tableState: TableState,
-  headerCells: MarkdownTableCell[],
-  rowCells: MarkdownTableCell[][],
-) {
-  const table: MarkdownTableWithSource = {
-    headers: headerCells.map((cell) => cell.text),
-    rows: rowCells.map((row) => row.map((cell) => cell.text)),
-    headerCells,
-    rowCells,
-    placeholderOffset: state.text.length,
-    ...(tableState.aligns.some(Boolean) ? { aligns: [...tableState.aligns] } : {}),
-  };
-  state.collectedTables.push(table);
-  if (tableState.sourceLines) {
-    const [first, after] = tableState.sourceLines;
-    const { lines, starts } = (state.sourceIndex ??= indexSourceLines(state.source));
-    const column = state.env.tableSourceColumns?.get(first) ?? 0;
-    defineMetadata(table, "source", {
-      start: (starts[first] ?? 0) + column,
-      end: (starts[after - 1] ?? 0) + (lines[after - 1]?.length ?? 0),
-      // Continue list markers as indentation while retaining enclosing quote markers.
-      prefix: (lines[first] ?? "").slice(0, column).replace(/[^\t >]/gu, " "),
-      headers: tableState.sourceHeaders,
-      rows: tableState.sourceRows,
-    });
-  }
-}
-
 function renderTable(state: RenderState) {
   const table = state.table;
   if (!table || !["block", "bullets", "code"].includes(state.tableMode)) {
@@ -896,7 +840,28 @@ function renderTable(state: RenderState) {
   const headers = table.headers.map(trimCell);
   const rows = table.rows.map((row) => row.map(trimCell));
   if (state.tableMode === "block") {
-    collectTableBlock(state, table, headers, rows);
+    const collectedTable: MarkdownTableWithSource = {
+      headers: headers.map((cell) => cell.text),
+      rows: rows.map((row) => row.map((cell) => cell.text)),
+      headerCells: headers,
+      rowCells: rows,
+      placeholderOffset: state.text.length,
+      ...(table.aligns.some(Boolean) ? { aligns: [...table.aligns] } : {}),
+    };
+    state.collectedTables.push(collectedTable);
+    if (table.sourceLines) {
+      const [first, after] = table.sourceLines;
+      const { lines, starts } = (state.sourceIndex ??= indexSourceLines(state.source));
+      const column = state.env.tableSourceColumns?.get(first) ?? 0;
+      defineMetadata(collectedTable, "source", {
+        start: (starts[first] ?? 0) + column,
+        end: (starts[after - 1] ?? 0) + (lines[after - 1]?.length ?? 0),
+        // Continue list markers as indentation while retaining enclosing quote markers.
+        prefix: (lines[first] ?? "").slice(0, column).replace(/[^\t >]/gu, " "),
+        headers: table.sourceHeaders,
+        rows: table.sourceRows,
+      });
+    }
     // Reserve a coordinate so later siblings cannot share this table's container boundary.
     state.text += "\n";
     return;
@@ -1067,7 +1032,9 @@ function renderTokens(tokens: MarkdownToken[], state: RenderState): void {
       case "bullet_list_open":
       case "ordered_list_open": {
         if (state.env.listStack.length > 0) {
-          appendNestedListSeparator(state);
+          if (!state.text.endsWith("\n")) {
+            state.text += "\n";
+          }
         }
         const ordered = token.type === "ordered_list_open";
         state.env.listStack.push({
@@ -1085,7 +1052,9 @@ function renderTokens(tokens: MarkdownToken[], state: RenderState): void {
       case "ordered_list_close":
         state.env.listStack.pop();
         if (state.env.listStack.length === 0) {
-          appendTopLevelListSeparator(state);
+          if (!state.text.endsWith("\n\n")) {
+            state.text += "\n";
+          }
         }
         break;
       case "list_item_open": {
@@ -1158,7 +1127,17 @@ function renderTokens(tokens: MarkdownToken[], state: RenderState): void {
 
       case "table_open":
         if (state.tableMode !== "off") {
-          state.table = initTableState();
+          state.table = {
+            sourceHeaders: [],
+            sourceRows: [],
+            currentSourceRow: [],
+            headers: [],
+            rows: [],
+            aligns: [],
+            currentRow: [],
+            currentCell: null,
+            inHeader: false,
+          };
           state.table.sourceLines = token.map ?? undefined;
           state.hasTables = true;
         }

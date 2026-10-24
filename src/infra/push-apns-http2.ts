@@ -30,21 +30,6 @@ type ApnsResponseBodyCapture = {
   truncated: boolean;
 };
 
-/** Parameters for opening an APNs HTTP/2 client session. */
-type ConnectApnsHttp2SessionParams = {
-  authority: string;
-  timeoutMs: number;
-  signal?: AbortSignal;
-};
-
-/** Parameters for validating APNs reachability through an explicit proxy. */
-type ProbeApnsHttp2ReachabilityViaProxyParams = {
-  authority: string;
-  proxyUrl: string;
-  proxyTls?: ManagedProxyTlsOptions;
-  timeoutMs: number;
-};
-
 /** APNs probe response used to prove a proxy tunneled to Apple. */
 type ProbeApnsHttp2ReachabilityViaProxyResult = {
   status: number;
@@ -196,9 +181,11 @@ async function openProxiedApnsHttp2Session(params: {
 }
 
 /** Connects to APNs directly, or through the active managed proxy when present. */
-export async function connectApnsHttp2Session(
-  params: ConnectApnsHttp2SessionParams,
-): Promise<http2.ClientHttp2Session> {
+export async function connectApnsHttp2Session(params: {
+  authority: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}): Promise<http2.ClientHttp2Session> {
   const authority = assertApnsAuthority(params.authority);
   const timeoutMs = resolveApnsHttp2TimeoutMs(params.timeoutMs);
   const proxyUrl = getActiveManagedProxyUrl();
@@ -251,9 +238,12 @@ export function getApnsResponseBodyCaptureText(capture: ApnsResponseBodyCapture)
 }
 
 /** Sends an intentionally invalid APNs push through a proxy to prove HTTP/2 reachability. */
-export async function probeApnsHttp2ReachabilityViaProxy(
-  params: ProbeApnsHttp2ReachabilityViaProxyParams,
-): Promise<ProbeApnsHttp2ReachabilityViaProxyResult> {
+export async function probeApnsHttp2ReachabilityViaProxy(params: {
+  authority: string;
+  proxyUrl: string;
+  proxyTls?: ManagedProxyTlsOptions;
+  timeoutMs: number;
+}): Promise<ProbeApnsHttp2ReachabilityViaProxyResult> {
   const authority = assertApnsAuthority(params.authority);
   const timeoutMs = resolveApnsHttp2TimeoutMs(params.timeoutMs);
   const session = await openProxiedApnsHttp2Session({
