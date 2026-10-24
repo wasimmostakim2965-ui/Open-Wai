@@ -1,9 +1,8 @@
-import { EventEmitter, once } from "node:events";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
-import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "../test-utils/prepare-compiled-subprocesses.js";
 import {
@@ -18,6 +17,7 @@ import {
   createManagedHandoffTempDirTracker,
   readManagedHandoffArtifacts,
 } from "./update-managed-service-handoff-artifacts.test-support.js";
+import { createManagedServiceChildMock as createChild } from "./update-managed-service-handoff-command.test-support.js";
 import {
   scopeWrapperSource,
   useHandoffFixtureReceipts,
@@ -36,17 +36,6 @@ const handoffParents = new Map<string, import("node:child_process").ChildProcess
 const mockedHandoffLeaseCleanups = new Set<() => void>();
 const receipts = useHandoffFixtureReceipts();
 type ConcurrentParams = Parameters<typeof writeConcurrentManagedHandoffParams>[0];
-
-function createChild() {
-  return Object.assign(new EventEmitter(), {
-    pid: process.pid,
-    exitCode: null,
-    signalCode: null,
-    stdin: new PassThrough(),
-    stdout: new PassThrough(),
-    unref: vi.fn(),
-  });
-}
 
 function createReadyChild(_command: string, args: string[]) {
   const child = createChild();
