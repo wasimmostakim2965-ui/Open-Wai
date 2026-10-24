@@ -539,6 +539,7 @@ export const validateCronUpdateParams = compile(
   cronUpdateDiagnostics,
 );
 export const validateCronRemoveParams = compile(S.CronRemoveParamsSchema);
+export const validateCronBindParams = compile(S.CronBindParamsSchema);
 export const validateCronRunParams = compile(S.CronRunParamsSchema);
 export const validateCronRunsParams = compile(S.CronRunsParamsSchema);
 export const validateCronHistoryParams = compile(S.CronHistoryParamsSchema);
